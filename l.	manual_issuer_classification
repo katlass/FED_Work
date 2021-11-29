@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Nov 25 10:47:24 2020
+
+@author: m1kal01
+"""
+########################################################################################################################################
+#This is the actual manual issuer classification menu, where the user gives the raw nmfp name a FED issuer classification for 
+#those we have never seen before.
+########################################################################################################################################
+import re
+import numpy as np
+import pandas as pd
+from collections import Counter
+from datetime import datetime
+import pickle
+from nltk.tokenize.treebank import TreebankWordDetokenizer
+pd.options.display.max_columns=500
+pd.options.display.max_rows=20
+########################################################################################################################################
+#This is just information for the unclassified data that is the output of classifier_alpha.py. 
+#We use these .pkl files because they are the same as writing to a csv, but they maintain datatype.
+#We update these .pkls everytime we classify a new entry in issuer classification, so if the execution 
+#aborts for some reason, your progress is saved and you won't have to start over, yet we don't need to keep opening and closing the database until the sql push later
+issuers=pd.read_pickle("Issuers_List.pkl")
+other_guesses=pd.read_pickle("OthGuesses_List.pkl")
+good_guesses=pd.read_pickle("GoodGuesses_List.pkl")
+cusips=pd.read_pickle("Cusips_List.pkl")
+index_iterator=pd.read_pickle("IndexIterator.pkl")
+df_old=pd.read_pickle("old_dataframe.pkl")
+issuer_ID_map_dict=pd.read_pickle("issuer_id_dictionary.pkl")
+issuer_ID_map_dict_reverse=pd.read_pickle("issuer_id_dictionary_reverse.pkl")
+max_issuer_id=pd.read_pickle("max_issuer_id.pkl")
+issuer_ids=pd.read_pickle("issuer_id_list.pkl")
+issuer_ids=issuer_ids+['-1']
+issuer_ID_map_dict_reverse[-1]='Unknown'
+
+#This is the most recent raw nmfp data for the month we are processing
+dfNew=pd.read_csv("securities_new16_currentMonth.csv",usecols=["s_CUSIP","s_InvIssuer"])
+dfNew.columns=["s_CUSIP","s_InvIssuer"]
+dfNew['s_InvIssuer']=dfNew['s_InvIssuer'].str.lower().str.strip() 
+dfNew['s_CUSIP']=dfNew['s_CUSIP'].str.lower().str.strip()
+dfNew['s_CUSIP']=dfNew['s_CUSIP'].fillna('')
+dfNew['s_CUSIP']=dfNew['s_CUSIP'].replace("!",'')
+
+########################################################################################################################################
+########################################################################################################################################
+### Callable Functions to classify issuers ###
+def NewIssuerInfo(Raw_Name,Cusip,Issuers,Issuer_IDs,MaxIssuerId,IssuerName,df,IssuerIdMapDict,new_df,IssuerIdMapDictReverse): #Add new issuer
+      Parent=input("Parent issuer_id (#): ")
+      #list of string integers that can be parent number
+      while Parent not in Issuer_IDs:
+          print("There is no issuer with issuer id: ",Parent)
+          Parent=input("Please enter an integer number for parent issuer id: ")
+      Country=input("Country (enter -1 if none): ")
+      if len(Country)<=3: Country=str(Country).upper() #just cleaning up string case
+      else:Country=str(Country).title()
+      #Modify the line below to add an issuer country
+      while Country not in ['-1', 'Australia', 'Austria', 'Bavaria', 'Belgium', 'Bermuda', 'Brazil', 'CAN', 'Canada', 'Cayman Islands', 'Chile', 'China', 'Denmark', 'Finland', 'France', 'Germany', 'India', 'Ireland', 'Israel', 'Italy', 'Japan', 'Korea', 'Kuwait', 'Luxembourg', 'Malaysia', 'Mexico', 'ND', 'Netherlands', 'New Zealand', 'Norway', 'Philippines', 'Qatar', 'Singapore', 'South Korea', 'Spain', 'Supra-Eu', 'Supra-NA', 'Supra-Ot', 'Supra-SA', 'Sweden', 'Switzerland', 'Taiwan', 'Turkey', 'UAE', 'UK', 'Ukraine', 'USA', 'Venezuela']:
+          print("That is not one of the acceptable countries, try these! :")
+          print(['-1', 'Australia', 'Austria', 'Bavaria', 'Belgium', 'Bermuda', 'Brazil', 'CAN', 'Canada', 'Cayman Islands', 'Chile', 'China', 'Denmark', 'Finland', 'France', 'Germany', 'India', 'Ireland', 'Israel', 'Italy', 'Japan', 'Korea', 'Kuwait', 'Luxembourg', 'Malaysia', 'Mexico', 'ND', 'Netherlands', 'New Zealand', 'Norway', 'Philippines', 'Qatar', 'Singapore', 'South Korea', 'Spain', 'Supra-Eu', 'Supra-NA', 'Supra-Ot', 'Supra-SA', 'Sweden', 'Switzerland', 'Taiwan', 'Turkey', 'UAE', 'UK', 'Ukraine', 'USA', 'Venezuela'])
+          Country=input("Country (enter -1 if none): ")
+          if len(Country)<=3:Country=str(Country).upper()
+          else:Country=str(Country).title()        
+      Type=input("1.) Municipal\n2.) Bank\n3.) GSE\n4.) Insurance Company\n5.) Nonfinancial\n6.) Other Financial\n7.) Other\n8.) Other Government\n9.) Sovereign\n10.) Supranational\nWhat is its Type: ")
+      while Type not in ['1','2','3','4','5','6','7','8','9','10']:
+          print("please enter an integer number (1-10) for type")
+          Type=input("1.) Municipal\n2.) Bank\n3.) GSE\n4.) Insurance Company\n5.) Nonfinancial\n6.) Other Financial\n7.) Other\n8.) Other Government\n9.) Sovereign\n10.) Supranational\nWhat is its Type: ")
+      Verify=input("Are you sure you want to add this issuer (Y/N): ")
+      while str(Verify).lower() not in ['y','n']:
+           print("please enter charcater value Y or N without quotation marks to add this issuer")
+           Verify=input("Are you sure you want to add this issuer (Y/N): ")
+      if str.lower(Verify) == 'y':
+          MaxIssuerId=MaxIssuerId+1 #Increase the max issuer number
+          IssuerIdMapDict[IssuerName]=MaxIssuerId
+          IssuerIdMapDictReverse[MaxIssuerId]=IssuerName
+          today = datetime.now().strftime("%Y-%m-%d")
+          IssuerTypeDict={1:'Municipal',2:'Bank',3:'GSE',4:'Insurance Company',5:'Nonfinancial',6:'Other Financial',7:'Other',8:'Other Government',9:'Sovereign',10:'Supranational'}
+          Row=pd.DataFrame(np.array([Parent,MaxIssuerId,Country,IssuerTypeDict[int(Type)],IssuerName,today,today]).reshape(-1, 7),columns=['parent', 'issuer_id', 'country', 'type','name','added','updated'])
+          #This is added in the case the program breaks, so we don't lose your work
+          Row['timestamp']=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+          NewPkl=pd.read_pickle("new_issuer_manual_classifications.pkl")
+          NewPkl=NewPkl.append(Row)
+          with open('new_issuer_manual_classifications.pkl', 'wb') as f:
+              pickle.dump(NewPkl, f) 
+          if Raw_Name == None:
+              AllIssuers=Issuers+df.s_InvIssuer.values.tolist()
+              while Raw_Name not in AllIssuers:
+                  print("You added this issuer but classified nothing to it. Please enter the raw nmfp name you'd like to classify as this new issuer: ")
+                  Raw_Name=input("The new issuer "+str(IssuerName)+" corresponds to: ")   
+          Issuer_IDs=Issuer_IDs+[str(MaxIssuerId)]
+          with open('issuer_id_list.pkl', 'wb') as f:
+              pickle.dump(Issuer_IDs, f)
+          with open("issuer_id_dictionary.pkl", 'wb') as f:
+              pickle.dump(IssuerIdMapDict, f)
+          with open("issuer_id_dictionary_reverse.pkl", 'wb') as f:
+              pickle.dump(IssuerIdMapDictReverse, f)
+      else:
+          IssuerName=None
+      return([IssuerName,MaxIssuerId,IssuerIdMapDict,Issuer_IDs,df,IssuerIdMapDictReverse])
+         
+def MyGuess(Guess,Raw_Name,df):  #Guess is "GoodGuess" from classifier_alpha.py. It is the algorithm's best prediction
+     #Display the s_InvIssuer (raw_nmfp name) for my Guess issuer with the most words in common with the current raw_name. 
+     #This will give user an idea if the raw names for the issuer are close enough
+     UniqueInvIssuers=np.unique(df[df['issuer']==Guess].s_InvIssuer.values)
+     UniqueInvIssuersToken=[x.split() for x in UniqueInvIssuers]
+     s_InvIssuer=Common(Raw_Name.split(),UniqueInvIssuersToken)
+     s_InvIssuer=TreebankWordDetokenizer().detokenize(s_InvIssuer)
+     print("My Guess is: ",Guess,' - ',s_InvIssuer)
+     HasNoGoodGuess=input("If this is incorrect, enter n to let me show you other guesses: ")
+     if HasNoGoodGuess == '' : CorrectClassification=Guess
+     else: CorrectClassification=None
+     return(CorrectClassification)      
+     
+def IteratingResults(Choices):  #This prints a dialogue of choices
+      for guess in range(0,len(Choices)):
+            if len(str(guess+1)) == 1: print("Option ",guess+1," :",Choices[guess]) #This is just to make display formatting better
+            else: print("Option ",guess+1,":",Choices[guess])
+      Answer=input("Please enter your selection, if you see no correct suggestions, hit enter ")
+      if Answer == '' : CorrectClassification=None
+      else:
+          PossibleOptionNumbers=[]    
+          for x in range(0,len(Choices)):PossibleOptionNumbers=PossibleOptionNumbers+[str(x+1)] #list of string integers that can be an option for calssification
+          while Answer not in PossibleOptionNumbers: #This function calls itself, where if someone tries to pick a number that's not one of the options given it just restarts the function 
+              return(IteratingResults(Choices))
+          CorrectClassification=Choices[int(Answer)-1]
+      return(CorrectClassification)      
+
+def Common(x,y): #For a given x,y combo search in x for most common words in y
+    try: y=y[np.argmax([len(np.intersect1d(x,item)) for item in y])]
+    except:  pass
+    return(y)
+
+#Finding, for each unique issuer that apears in the search results, the s_InvIssuer (raw nmfp name) that has the selected phrase and also has the most words in common with the current raw nmfp name
+def ClosestToIssuer(Raw_Name,Search_Results,Unique_Issuers,Issuer_Names):
+    Closest_s_InvIssuers=[]
+    for x in Unique_Issuers:
+        Indeces=(np.array(Issuer_Names) == x).nonzero()[0]
+        PossibleForIssuerToken=[x.split() for x in [Search_Results[item] for item in Indeces]]
+        Closest_s_InvIssuers=Closest_s_InvIssuers+[Common(Raw_Name.split(),PossibleForIssuerToken)]
+    Closest_s_InvIssuers=list(map(lambda x:TreebankWordDetokenizer().detokenize(x),Closest_s_InvIssuers))
+    return(Closest_s_InvIssuers)
+
+def StringSearchFunction(Raw_Name,Phrase,df,IssuerIdMapDict,End_Flag=0): #This is a string search amongst issuers/s_InvIssuer titles
+    #Splitting it up so order doesn't matter
+    Phrase=Phrase.split()
+    PatternString='^'   #this allows re to match it in different ways, i.e the phrase is the first item in the string, last item, between items etc
+    for x in range (0,len(Phrase)):PatternString=PatternString+'(?=.*'+Phrase[x]+')'
+    pattern = re.compile(PatternString+'.+$')
+    UniqueIssuers=np.unique(df['issuer'])
+    UniqueInvIssuers=np.unique(df['s_InvIssuer'])
+    #First getting search results based off s_InvIssuer strings and then returning the issuer
+    DictInv=pd.Series(df.issuer.values,index=df.s_InvIssuer).to_dict()
+    SearchResultsSInv=list(filter(lambda x: pattern.findall(x),UniqueInvIssuers))
+    #Finding, for each unique issuer that apears in the search results, the s_inv issuer that has the selected phrase and also has the most words in common with the raw nmfp name (s_InvIssuer)
+    SearchToIssuers_inv=list(map(lambda x: DictInv[x] if x in DictInv else None,SearchResultsSInv))
+    SearchResultsSInvUn=np.unique(SearchToIssuers_inv) #########hgdfyhdfyh
+    if End_Flag == 1:
+        Closest_s_InvIssuers=SearchResultsSInvUn
+    else:
+        Closest_s_InvIssuers=ClosestToIssuer(Raw_Name,SearchResultsSInv,SearchResultsSInvUn,SearchToIssuers_inv)
+    #Then getting search results based on issuer string
+    if len(SearchResultsSInvUn)>5:
+         FrequentlyClassified=Counter(SearchToIssuers_inv)
+         FrequentlyClassified_inv=[item[0] for item in FrequentlyClassified.most_common(5)]
+         if End_Flag == 1:
+             Closest_s_InvIssuers=FrequentlyClassified_inv
+         else:
+             Closest_s_InvIssuers=ClosestToIssuer(Raw_Name,SearchResultsSInv,FrequentlyClassified_inv,SearchToIssuers_inv)
+    else:
+        FrequentlyClassified_inv=list(SearchResultsSInvUn)
+    SearchResultsIssuer=list(filter(lambda x: pattern.findall(x),UniqueIssuers))
+    SearchResultsIssuerUn=np.unique(SearchResultsIssuer)
+    IssuerToSInv=df[df['issuer'].isin(SearchResultsIssuerUn)].s_InvIssuer.values
+    SearchToIssuers_iss=list(map(lambda x: DictInv[x] if x in DictInv else None,IssuerToSInv))
+    if End_Flag == 1:
+        Closest_s_InvIssuers_Issuer=pd.unique(SearchToIssuers_iss)
+    else:
+        Closest_s_InvIssuers_Issuer=ClosestToIssuer(Raw_Name,IssuerToSInv,SearchResultsIssuerUn,SearchToIssuers_iss)
+    #If there is a lot of matching issuers, then grab most common 5
+    if len(SearchResultsIssuerUn)>5:
+         FrequentlyClassified=Counter(SearchToIssuers_iss)
+         FrequentlyClassified_iss=[item[0] for item in FrequentlyClassified.most_common(5)]
+         if End_Flag == 1:
+             Closest_s_InvIssuers_Issuer=FrequentlyClassified_iss
+         else:
+             Closest_s_InvIssuers_Issuer=ClosestToIssuer(Raw_Name,IssuerToSInv,FrequentlyClassified_iss,SearchToIssuers_iss)
+    else:
+        FrequentlyClassified_iss=list(SearchResultsIssuerUn)
+    #This block is added in the case the same issuer appears in both, when we unique() we sill want to preserve integrity of the s_InvIssuers that matched that issuer
+    SearchResultsIssuer=np.append(FrequentlyClassified_inv,FrequentlyClassified_iss)
+    SearchResultsInv=np.append(Closest_s_InvIssuers,Closest_s_InvIssuers_Issuer)
+    IssDictFinal = {SearchResultsIssuer[i]: SearchResultsInv[i] for i in range(len(SearchResultsInv))}
+    SearchResultsIssuer=np.unique(SearchResultsIssuer)
+    s_InvMatching=[IssDictFinal[item] for item in SearchResultsIssuer]
+    #Want to add part to iterating results where we add new line if too long idl=k though
+    IDs=list(map(lambda x: int(IssuerIdMapDict[x]) if x in IssuerIdMapDict else None,SearchResultsIssuer))
+    SearchResults=list(map(lambda x,y,z: str(y)+"           |"+str(x)+" | "+str(z) if len(str(y)) == 1 else str(y)+"          |"+str(x)+" | "+str(z) if len(str(y))  == 2 else str(y)+"         |"+str(x)+" | "+str(z) if len(str(y))  == 3 else str(y)+"        |"+str(x)+" | "+str(z) if len(str(y))  == 4  else None,SearchResultsIssuer,IDs,s_InvMatching))
+    print("Issuers to chose from: ")
+    print("Option     Issuer ID     Issuer | Past Raw NMFP Name")
+    CorrectClassification=IteratingResults(SearchResults)
+    try:
+        CorrectClassification=CorrectClassification.split('|', 2)[-2].strip()
+    except:
+        pass
+    return(CorrectClassification)
+
+#Given a FED issuer_id number, show me all the raw nmfp names (s_InvIssuers) that have been classified under it
+def SearchClassificationsForIssuer(IssuerId,Issuer_IDs,df): #the equivalent of ilist in the old system
+    while IssuerId not in Issuer_IDs: #Block to prevent them from entering an issuer_id that doesn't exist
+          print("There is no issuer with issuer id: ",IssuerId)
+          IssuerId=input("please enter an integer number for issuer id: ")
+    dataframe=df[df['issuer_id']==int(IssuerId)]
+    print("CUSIP          s_InvIssuer Title")
+    for guess in range(0,len(dataframe)):
+        if dataframe.s_CUSIP.values[guess] == "":
+            print("               "+dataframe.s_InvIssuer.values[guess]) 
+        else:
+             print(dataframe.s_CUSIP.values[guess]+"   "+dataframe.s_InvIssuer.values[guess])
+    return()
+    
+
+#Given a FED issuer_id number, show me the detailed issuer information
+def SearchIssuerDetails(IssuerId,Issuer_IDs): #the equivalent of iinfo in the old system
+    while IssuerId not in Issuer_IDs: #Block to prevent them from entering an issuer_id that doesn't exist
+          print("There is no issuer with issuer id: ",IssuerId)
+          IssuerId=input("please enter an integer number for issuer id: ")
+    IssuerDetails=pd.read_csv("IssuerDetails.csv")
+    IssuerDetails['name']=IssuerDetails['name'].str.lower().str.strip()
+    NewIssuers=pd.read_pickle("new_issuer_manual_classifications.pkl")
+    NewIssuers['issuer_id']=NewIssuers['issuer_id'].astype('int64')
+    NewIssuers['parent']=NewIssuers['parent'].astype('int64')
+    IssuerDetails=IssuerDetails.append(NewIssuers, ignore_index=True)
+    dataframe=IssuerDetails[IssuerDetails['issuer_id']==int(IssuerId)]
+    print("##############################################################################################")
+    print(dataframe)
+    print("##############################################################################################")
+    return()
+    
+    
+#Delete an issuer     
+def DeleteIssuerDetails(IssuerId,Issuer_IDs,df,IssuerIdMapDictReverse,IssuerIdMapDict): #the equivalent of idel in the old system
+    pd.options.mode.chained_assignment = None #ignore useless warning
+    while IssuerId not in Issuer_IDs: #Block to prevent them from entering an issuer_id that doesn't exist
+          print("There is no issuer with issuer id: ",IssuerId)
+          IssuerId=input("please enter an integer number for issuer id: ")
+    IssuerDetails=pd.read_csv("IssuerDetails.csv")
+    IssuerDetails['name']=IssuerDetails['name'].str.lower().str.strip()
+    NewIssuers=pd.read_pickle("new_issuer_manual_classifications.pkl")
+    NewIssuers['issuer_id']=NewIssuers['issuer_id'].astype('int64')
+    NewIssuers['parent']=NewIssuers['parent'].astype('int64')
+    Combodf=IssuerDetails.append(NewIssuers, ignore_index=True)
+    dataframe=Combodf[Combodf['issuer_id']==int(IssuerId)]
+    Verify=input("Are you sure you want to delete issuer \'"+str(dataframe.name.values[0])+"\' (Y/N): ")
+    while str(Verify).lower() not in ['y','n']:
+        print("please enter charcater value Y or N without quotation marks to add this issuer")
+        Verify=input("Are you sure you want to delete issuer "+str(dataframe.name.values)+" (Y/N): ")
+    if str.lower(Verify) == 'y':
+        dataframe['timestamp']=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        DelPkl=pd.read_pickle("delete_issuer_manual_classifications.pkl")
+        DelPkl=DelPkl.append(dataframe)
+        with open('delete_issuer_manual_classifications.pkl', 'wb') as f:
+            pickle.dump(DelPkl, f) 
+            
+        IssuerDetails=IssuerDetails[IssuerDetails['issuer_id']!=int(IssuerId)]
+        IssuerDetails.to_csv("IssuerDetails.csv",
+                       index=False,
+                       header=True
+                       )
+        Issuer_IDs=[item for item in Issuer_IDs if item != IssuerId]
+        NewIssuers=NewIssuers[NewIssuers['issuer_id']!=int(IssuerId)]
+        NewIssuers['timestamp']=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open('new_issuer_manual_classifications.pkl', 'wb') as f:
+            pickle.dump(NewIssuers, f) 
+            
+        df=df[df['issuer'] != str(dataframe.name.values[0])]
+        with open('old_dataframe.pkl', 'wb') as f:
+                pickle.dump(df, f) 
+        del IssuerIdMapDictReverse[int(IssuerId)]
+        with open('issuer_id_dictionary_reverse.pkl', 'wb') as f:
+                pickle.dump(IssuerIdMapDictReverse, f) 
+        del IssuerIdMapDict[str(dataframe.name.values[0])]
+        with open('issuer_id_dictionary.pkl', 'wb') as f:
+                pickle.dump(IssuerIdMapDict, f)  
+    return(Issuer_IDs,df,IssuerIdMapDictReverse,IssuerIdMapDict)
+    
+    
+#Modify issuer detail information 
+def ModifyIssuerDetails(IssuerId,Issuer_IDs,IssuerIdMapDictReverse,df,IssuerIdMapDict): #the equivalent of imod in the old system
+    pd.options.mode.chained_assignment = None #ignore useless warning
+    while IssuerId not in Issuer_IDs: #Block to prevent them from entering an issuer_id that doesn't exist
+          print("There is no issuer with issuer id: ",IssuerId)
+          IssuerId=input("please enter an integer number for issuer id: ")
+    IssuerDetails=pd.read_csv("IssuerDetails.csv")
+    IssuerDetails['name']=IssuerDetails['name'].str.lower().str.strip()
+    NewIssuers=pd.read_pickle("new_issuer_manual_classifications.pkl")
+    NewIssuers['issuer_id']=NewIssuers['issuer_id'].astype('int64')
+    NewIssuers['parent']=NewIssuers['parent'].astype('int64')
+    Combodf=IssuerDetails.append(NewIssuers, ignore_index=True)
+    dataframe=Combodf[Combodf['issuer_id']==int(IssuerId)]
+    print("#########################################################################################")
+    print(dataframe)
+    OriginalName=str(dataframe.name.values[0])
+    FieldsDict={1:'parent',2:'country',3:'type',4:'issuer name'}
+    print("What would you like to change for issuer: "+OriginalName+"?")
+    Fields=input("1.) Parent\n2.) Country\n3.) Type\n4.) Issuer Name: ")
+    while Fields not in ['1','2','3','4']:
+          print("please enter an integer number (1-4) for issuer detail to change")
+          Fields=input("1.) Parent\n2.) Country\n3.) Type\n4.) Name: ")
+    print("You are changing the "+str(FieldsDict[int(Fields)])+" for "+str(dataframe.name.values[0]))
+    if Fields == '1':
+      Answer=input("Parent issuer_id (#): ")
+      #list of string integers that can be parent number
+      while  Answer not in Issuer_IDs:
+          print("There is no issuer with issuer id: ", Answer)
+          Answer=input("Please enter an integer number for parent issuer id: ")
+      print("Changing parent from "+str(IssuerIdMapDictReverse[dataframe['parent'].values[0]])+" to "+str(IssuerIdMapDictReverse[int(Answer)]))
+      dataframe['parent']=int(Answer)
+      dataframe['flag']='parent'
+      dataframe['name_real']=dataframe['name'].values[0]
+    if Fields == '2':
+      Answer=input("Country (enter -1 if none): ")
+      if len(Answer)<=3: Answer=str(Answer).upper() #just cleaning up string case
+      else:Answer=str(Answer).title()
+      #Modify the line below to add an issuer country
+      while Answer not in ['-1', 'Australia', 'Austria', 'Bavaria', 'Belgium', 'Bermuda', 'Brazil', 'CAN', 'Canada', 'Cayman Islands', 'Chile', 'China', 'Denmark', 'Finland', 'France', 'Germany', 'India', 'Ireland', 'Israel', 'Italy', 'Japan', 'Korea', 'Kuwait', 'Luxembourg', 'Malaysia', 'Mexico', 'ND', 'Netherlands', 'New Zealand', 'Norway', 'Philippines', 'Qatar', 'Singapore', 'South Korea', 'Spain', 'Supra-Eu', 'Supra-NA', 'Supra-Ot', 'Supra-SA', 'Sweden', 'Switzerland', 'Taiwan', 'Turkey', 'UAE', 'UK', 'Ukraine', 'USA', 'Venezuela']:
+          print("That is not one of the acceptable countries, try these! :")
+          print(['-1', 'Australia', 'Austria', 'Bavaria', 'Belgium', 'Bermuda', 'Brazil', 'CAN', 'Canada', 'Cayman Islands', 'Chile', 'China', 'Denmark', 'Finland', 'France', 'Germany', 'India', 'Ireland', 'Israel', 'Italy', 'Japan', 'Korea', 'Kuwait', 'Luxembourg', 'Malaysia', 'Mexico', 'ND', 'Netherlands', 'New Zealand', 'Norway', 'Philippines', 'Qatar', 'Singapore', 'South Korea', 'Spain', 'Supra-Eu', 'Supra-NA', 'Supra-Ot', 'Supra-SA', 'Sweden', 'Switzerland', 'Taiwan', 'Turkey', 'UAE', 'UK', 'Ukraine', 'USA', 'Venezuela'])
+          Answer=input("Country (enter -1 if none): ")
+          if len(Answer)<=3:Answer=str(Answer).upper()
+          else:Answer=str(Answer).title()
+      print("Changing country from "+str(dataframe.country.values[0])+" to "+Answer)
+      dataframe['country']=Answer
+      dataframe['flag']='country'
+      dataframe['name_real']=dataframe['name'].values[0]
+    if Fields == '3':
+      Answer=input("1.) Municipal\n2.) Bank\n3.) GSE\n4.) Insurance Company\n5.) Nonfinancial\n6.) Other Financial\n7.) Other\n8.) Other Government\n9.) Sovereign\n10.) Supranational\nWhat is its Type: ")
+      while Answer not in ['1','2','3','4','5','6','7','8','9','10']:
+          print("please enter an integer number (1-10) for type")
+          Answer=input("1.) Municipal\n2.) Bank\n3.) GSE\n4.) Insurance Company\n5.) Nonfinancial\n6.) Other Financial\n7.) Other\n8.) Other Government\n9.) Sovereign\n10.) Supranational\nWhat is its Type: ")
+      IssuerTypeDict={1:'Municipal',2:'Bank',3:'GSE',4:'Insurance Company',5:'Nonfinancial',6:'Other Financial',7:'Other',8:'Other Government',9:'Sovereign',10:'Supranational'}
+      print("Changing type from "+str(dataframe.type.values[0])+" to "+str(IssuerTypeDict[int(Answer)]))
+      dataframe['type']=IssuerTypeDict[int(Answer)]
+      dataframe['flag']="type"
+      dataframe['name_real']=dataframe['name'].values[0]
+    if Fields == '4': 
+      Answer=str.lower(input("New Issuer Name: "))
+      while Answer in IssuerDetails.name.values: #make sure they dont copy an old issuer name
+          print("please enter a new issuer that does not already exist!")
+          Answer=str.lower(input("New Issuer Name: "))
+      print("Changing issuer name from "+str(dataframe.name.values[0])+" to "+Answer)
+      dataframe['flag']="name"
+      dataframe['name_real']=dataframe['name'].values[0]
+      dataframe['name']=Answer
+    Verify=input("Are you sure you want to modify issuer \'"+OriginalName+"\' (Y/N): ")
+    while str(Verify).lower() not in ['y','n']:
+        print("please enter charcater value Y or N without quotation marks to add this issuer")
+        Verify=input("Are you sure you want to modify issuer \'"+OriginalName+"\' (Y/N): ")
+    if str.lower(Verify) == 'y':
+        dataframe['timestamp']=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ModPkl=pd.read_pickle("modify_issuers_issuer_manual_classifications.pkl")
+        ModPkl=ModPkl.append(dataframe)
+        with open('modify_issuers_issuer_manual_classifications.pkl', 'wb') as f:
+            pickle.dump(ModPkl, f) 
+        if int(IssuerId) in IssuerDetails['issuer_id'].values:
+            IssuerDetails=IssuerDetails[IssuerDetails['issuer_id']!=int(IssuerId)]
+            IssuerDetails=IssuerDetails.append(dataframe[['parent', 'issuer_id', 'country', 'type', 'name', 'added', 'updated']])
+            IssuerDetails.to_csv("IssuerDetails.csv",
+                           index=False,
+                           header=True
+                           )
+        if int(IssuerId) in NewIssuers['issuer_id'].values:        
+            NewIssuers=NewIssuers[NewIssuers['issuer_id']!=int(IssuerId)]
+            NewIssuers=NewIssuers.append(dataframe[['parent', 'issuer_id', 'country', 'type', 'name', 'added', 'updated']])
+            NewIssuers['timestamp']=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open('new_issuer_manual_classifications.pkl', 'wb') as f:
+                pickle.dump(NewIssuers, f) 
+        if Fields == '4':
+            df['issuer']=df['issuer'].replace(str(dataframe.name_real.values[0]),str(Answer))
+            with open('old_dataframe.pkl', 'wb') as f:
+                pickle.dump(df, f) 
+            IssuerIdMapDictReverse[int(IssuerId)]=str(Answer)
+            with open('issuer_id_dictionary_reverse.pkl', 'wb') as f:
+                pickle.dump(IssuerIdMapDictReverse, f) 
+            IssuerIdMapDict[str(Answer)]=int(IssuerId)
+            with open('issuer_id_dictionary.pkl', 'wb') as f:
+                pickle.dump(IssuerIdMapDict, f)             
+    print("#########################################################################################")
+    return(df,IssuerIdMapDictReverse,IssuerIdMapDict)
+     
+#Given a raw nmfp name (s_InvIssuer) lets change it from being classified as one issuer_id to another issuer_id    
+def ModifyClassifications(Raw_Name,df,IssuerId,Issuer_IDs,IssuerIdMapDictReverse): #formerly amod   
+    #need to add a block so, if it was a modifiication to an issuer in x_test, it just goes ahead and deltes the past classification and uses the right one
+    if Raw_Name not in df['s_InvIssuer'].values: 
+        print("###############################################")
+        print(str(Raw_Name)+" has never been classified before")
+        print("###############################################")
+        return(df)
+    dataframe=df[df['s_InvIssuer']==Raw_Name]
+    NewId=input("Enter the issuer_id for the issuer you'd like to change this to: ")   
+    while NewId not in Issuer_IDs: #Block to prevent them from entering an issuer_id that doesn't exist
+          print("There is no issuer with issuer id: ",NewId)
+          NewId=input("please enter an integer number for issuer id: ")
+    Answer = IssuerIdMapDictReverse[int(NewId)]
+    print("You are about to change all classifications for the raw nmfp name \'",Raw_Name,"\' to the FED issuer \'",Answer,"\'")
+    Verify=input("Are you sure you want to change this issuer (Y/N): ")
+    while str(Verify).lower() not in ['y','n']:
+        print("please enter charcater value Y or N without quotation marks to add this issuer")
+        Verify=input("Are you sure you want to add this issuer (Y/N): ")
+    if str.lower(Verify) == 'y':
+        dfOrig=df[df['s_InvIssuer']!=Raw_Name]
+        pd.options.mode.chained_assignment = None #ignore useless warning
+        dataframe['issuer']=Answer
+        dataframe['issuer_id']=int(NewId)
+        #This is added in the case the program breaks, so we don't lose your work
+        dataframe['timestamp']=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ModPkl=pd.read_pickle("modify_issuer_manual_classifications.pkl")
+        ModPkl=ModPkl.append(dataframe)
+        with open('modify_issuer_manual_classifications.pkl', 'wb') as f:
+            pickle.dump(ModPkl, f) 
+        df=dfOrig.append(dataframe) #Add new issuer to current df, so we can update our issuer_id maps to include newly modified issuer
+    return(df)
+
+#This is the actual dialogue menu where the user tells us which function they'd like to do, search, mod classifier, etc  
+def UserEngagement(Raw_Name,Answer,Cusips,Issuers,Issuer_IDs,MaxIssuerId,df,IssuerIdMapDict,IssuerIdMapDictReverse,new_df,End_Flag=0):
+    print("NMFP Raw Issuer Name: ",Raw_Name)
+    print("###########Options##############")
+    print("1.) s + string: to search issuers/raw nmfp names from a string \n2.) ilist + issuer_id (#): to list all past classifications for an issuer\n3.) amod + raw nmfp name: to modify a past classification\n4.) imod + issuer name: to modify an issuer's information\n5.) add + issuer name: to add a new issuer\n6.) class + issuer_number: to classify as a specific issuer id number\n7.) iinfo + issuer_number: to show issuer details information for a issuer\n8.) idel + number: delete issuer")
+    DialogueOption=str.lower(input("Enter a selection or press enter to continue: "))
+    while (DialogueOption != '' and Answer ==None) or End_Flag == 1: #Until the user hits enter and there is still no answer, keep asking user 
+        if DialogueOption[0:2] == 's ':
+            Answer=StringSearchFunction(Raw_Name,str.lower(DialogueOption[2:]),df,IssuerIdMapDict,End_Flag=End_Flag) 
+        if str.lower(DialogueOption[0:6]) == 'ilist ':
+            SearchClassificationsForIssuer(str.lower(DialogueOption[6:]),Issuer_IDs,df)
+        if str.lower(DialogueOption[0:4]) == 'add ':
+            Results=NewIssuerInfo(Raw_Name,Cusips,Issuers,Issuer_IDs,MaxIssuerId,str.lower(DialogueOption[4:]),df,IssuerIdMapDict,new_df,IssuerIdMapDictReverse)
+            Answer=Results[0]
+            MaxIssuerId=Results[1]
+            IssuerIdMapDict=Results[2]
+            Issuer_IDs=Results[3]
+            df=Results[4]
+            IssuerIdMapDictReverse=Results[5]
+        if str.lower(DialogueOption[0:6]) == 'class ':
+            try:
+                Answer = IssuerIdMapDictReverse[int(str.lower(DialogueOption[6:]))]
+            except:
+                print("There is no issuer with issuer id: ",int(str.lower(DialogueOption[6:])))
+                print("please enter an integer number for issuer id: ")
+        if str.lower(DialogueOption[0:5]) == 'amod ':
+            df=ModifyClassifications(str.lower(DialogueOption[5:]),df,MaxIssuerId,Issuer_IDs,IssuerIdMapDictReverse)
+        if str.lower(DialogueOption[0:6]) == 'iinfo ':
+            SearchIssuerDetails(str.lower(DialogueOption[6:]),Issuer_IDs)
+        if str.lower(DialogueOption[0:5]) == 'idel ':
+            res=DeleteIssuerDetails(str.lower(DialogueOption[5:]),Issuer_IDs,df,IssuerIdMapDictReverse,IssuerIdMapDict)
+            Issuer_IDs=res[0]
+            df=res[1]
+            IssuerIdMapDictReverse=res[2]
+            IssuerIdMapDict=res[3]
+        if str.lower(DialogueOption[0:5]) == 'imod ':
+            result=ModifyIssuerDetails(str.lower(DialogueOption[5:]),Issuer_IDs,IssuerIdMapDictReverse,df,IssuerIdMapDict)  
+            df=result[0]
+            IssuerIdMapDictReverse=result[1]
+            IssuerIdMapDict=result[2]
+        print("###########Options##############")
+        print("1.) s + string: to search issuers/raw nmfp names from a string \n2.) ilist + issuer_id (#): to list all past classifications for an issuer\n3.) amod + raw nmfp name: to modify a past classification\n4.) imod + issuer name: to modify an issuer's information\n5.) add + issuer name: to add a new issuer\n6.) class + issuer_number: to classify as a specific issuer id number\n7.) iinfo + issuer_number: to show issuer details information for a issuer\n8.) idel + number: delete issuer")
+        DialogueOption=str.lower(input("Enter a selection or press enter to continue: "))
+    return(Answer,Issuer_IDs,MaxIssuerId,IssuerIdMapDict,df,IssuerIdMapDictReverse)
+
+#Main program executable
+def Main(Issuers,Cusips,OthGuesses,GoodGuesses,Issuer_IDs,MaxIssuerId,df,IssuerIdMapDict,x,IssuerIdMapDictReverse,new_df): #All parameters come from continuously saved .pkl files in case this program crashes to save results
+    print("Now let's go through my classifications!")
+    while x<len(Issuers): #This is set up so everytime it cant classfiy something, it adds it to the Issuers list, which increases the length and causes it to keep running
+        print("########################################")
+        print(len(Issuers)-x," left to classify!")
+        print("NMFP Raw Issuer Name: ",Issuers[x])
+        print("CUSIP: ",Cusips[x])
+        Answer=None
+        if GoodGuesses[x] != "": #Check if My guess is correct
+            Answer=MyGuess(GoodGuesses[x],Issuers[x],df)
+        if Answer==None: #Go through other possibilities I found
+            s_InvIssuers=[]
+            for guess in OthGuesses[x]: #grabbing most similar s_InvIssuer to raw name for each issuer
+                 UniqueInvIssuers=np.unique(df[df['issuer']==guess].s_InvIssuer.values)
+                 UniqueInvIssuersToken=[x.split() for x in UniqueInvIssuers] #split "bank of america" into ["bank ","of","america"]
+                 s_InvIssuer=Common(Issuers[x].split(),UniqueInvIssuersToken)
+                 s_InvIssuer=TreebankWordDetokenizer().detokenize(s_InvIssuer) #Put it back together into "bank of america"
+                 s_InvIssuers=s_InvIssuers+[s_InvIssuer]
+            IDs=list(map(lambda x: int(IssuerIdMapDict[x]) if x in IssuerIdMapDict else None,OthGuesses[x]))
+            SearchResults=list(map(lambda x,y,z: str(y)+"           |"+str(x)+" | "+str(z) if len(str(y)) == 1 else str(y)+"          |"+str(x)+" | "+str(z) if len(str(y))  == 2 else str(y)+"         |"+str(x)+" | "+str(z) if len(str(y))  == 3 else str(y)+"        |"+str(x)+" | "+str(z) if len(str(y))  == 4  else None,OthGuesses[x],IDs,s_InvIssuers))
+            print("Issuers to chose from: ")
+            print("Option     Issuer ID     Issuer | Past Raw NMFP Name")
+            Answer=IteratingResults(SearchResults)
+            try:  
+                Answer=Answer.split('|', 2)[-2].strip()
+            except:  Answer=None
+        if  Answer==None:  
+            Results=UserEngagement(Issuers[x],Answer,Cusips[x],Issuers,Issuer_IDs,MaxIssuerId,df,IssuerIdMapDict,IssuerIdMapDictReverse,new_df)
+            Answer=Results[0]
+            Issuer_IDs=Results[1]
+            MaxIssuerId=Results[2]
+            IssuerIdMapDict=Results[3]
+            df=Results[4]
+            IssuerIdMapDictReverse=Results[5]
+        #Answer="userchoice"
+        if Answer != None and Answer != "":
+            today = datetime.now().strftime("%Y-%m-%d")
+            AllCusips=new_df[new_df['s_InvIssuer']==Issuers[x]].drop_duplicates().s_CUSIP.values
+            for cusip6 in AllCusips:
+                Row=pd.DataFrame(np.array([today,Issuers[x],cusip6,Answer,IssuerIdMapDict[Answer]]).reshape(-1, 5),columns=['date', 's_InvIssuer', 's_CUSIP', 'issuer', 'issuer_id'])
+                #This is added in the case the program breaks, so we don't lose your work
+                Row['timestamp']=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ManPkl=pd.read_pickle("manual_classifications.pkl")
+                ManPkl=ManPkl.append(Row)
+                with open('manual_classifications.pkl', 'wb') as f:
+                    pickle.dump(ManPkl, f) 
+            Row=pd.DataFrame(np.array([today,Issuers[x],Cusips[x],Answer,IssuerIdMapDict[Answer]]).reshape(-1, 5),columns=['date', 's_InvIssuer', 's_CUSIP', 'issuer', 'issuer_id'])
+            df=df.append(Row)
+        else: #if still not right, recycle value and try to classify again later
+            print("########################################")
+            print("I couldn't make a decision for",Issuers[x],"so I'm adding it back to the list to be classified")
+            Issuers.append(Issuers[x]) #add it back to the list so we iterate through ones we couldnt classify
+            OthGuesses.append(OthGuesses[x])
+            GoodGuesses.append(GoodGuesses[x])
+            Cusips.append(Cusips[x])
+            print("########################################")
+        x=x+1
+        with open('Issuers_List.pkl', 'wb') as f:
+            pickle.dump(Issuers, f)
+        with open('OthGuesses_List.pkl', 'wb') as f:
+            pickle.dump(OthGuesses, f)            
+        with open('GoodGuesses_List.pkl', 'wb') as f:
+            pickle.dump(GoodGuesses, f)
+        with open('Cusips_List.pkl', 'wb') as f:
+            pickle.dump(Cusips, f)  
+        with open('IndexIterator.pkl', 'wb') as f:
+            pickle.dump(x, f) 
+        with open('old_dataframe.pkl', 'wb') as f:
+            pickle.dump(df, f) 
+        with open('issuer_id_dictionary.pkl', 'wb') as f:
+            pickle.dump(IssuerIdMapDict, f) 
+        with open('max_issuer_id.pkl', 'wb') as f:
+            pickle.dump(MaxIssuerId, f) 
+    print("Done with issuer classification!")   
+    Results=UserEngagement(None,None,None,Issuers,Issuer_IDs,MaxIssuerId,df,IssuerIdMapDict,IssuerIdMapDictReverse,new_df,End_Flag=1)
+    Answer=Results[0]
+    Issuer_IDs=Results[1]
+    MaxIssuerId=Results[2]
+    IssuerIdMapDict=Results[3]
+    df=Results[4]
+    IssuerIdMapDictReverse=Results[5]
+    return()
+
+Results=Main(issuers,cusips,other_guesses,good_guesses,issuer_ids,max_issuer_id,df_old,issuer_ID_map_dict,index_iterator,issuer_ID_map_dict_reverse,dfNew)      
