@@ -5,10 +5,10 @@ Created on Wed Nov 25 10:47:24 2020
 
 @author: m1kal01
 """
-########################################################################################################################################
+#########################################################################################################################################
 #This is the actual manual issuer classification menu, where the user gives the raw nmfp name a FED issuer classification for 
 #those we have never seen before.
-########################################################################################################################################
+#########################################################################################################################################
 import re
 import numpy as np
 import pandas as pd
@@ -18,7 +18,7 @@ import pickle
 from nltk.tokenize.treebank import TreebankWordDetokenizer
 pd.options.display.max_columns=500
 pd.options.display.max_rows=20
-########################################################################################################################################
+#########################################################################################################################################
 #This is just information for the unclassified data that is the output of classifier_alpha.py. 
 #We use these .pkl files because they are the same as writing to a csv, but they maintain datatype.
 #We update these .pkls everytime we classify a new entry in issuer classification, so if the execution 
