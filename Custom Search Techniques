@@ -2,13 +2,15 @@ import os
 
 directory="C:\Users\your_diretory"
 
+#Determine past exact issuer name matches and guess classes of 200-400 issuer names not previously seen
 print("I'll try my best to classify issuers with classifier.py!")
 os.system("python3 "+directory+"classifier_alpha.py")
 
+#Allow user to easily determine if guesses from classifier_alpha.py are correct, and perform many other actions on the issuers database
 print("Now you finish it up for me with manual_issuer_classification.py")
 os.system("python3 "+directory+"manual_issuer_classification.py")
 
-#Push Results to SQL
+#Push results to SQL database
 print("Now pushing to sql with sql_push.py")
 os.system("python3 "+directory+"sql_push.py")
 
