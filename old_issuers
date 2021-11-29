@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Nov 12 11:40:51 2020
+
+@author: m1kal01
+"""
+##########################################################################
+#This reads in securites_all_new16.sas7bdat and grabs most recent FED issuer for each s_InvIssuer (raw NMFP name)
+#It used fixed past misclassifications from same_name_diff_issuer.py - fix_issuer_cusip_diffs.pkl
+import pyreadstat
+import pandas as pd
+import pickle
+#Reads in last months securites_all_new
+cols = ["date","issuer","s_InvIssuer","s_CUSIP"]
+df, meta = pyreadstat.read_sas7bdat('securities_all_new16.sas7bdat', usecols=cols)
+df['s_CUSIP']=df['s_CUSIP'].fillna('')
+df['s_CUSIP']=df['s_CUSIP'].replace("!",'')
+#now just need to grab most recent observation for each s_InvIssuer/CUSIP for the dataset 
+dfMask=df.sort_values('date').drop_duplicates(['s_InvIssuer','s_CUSIP'],keep='last')
+
+#This block is added to fix the case where s_InvIssuer (NMFP raw name) has different issuers for different cusips. .pkl file comes from same_name_diff_issuer.py
+FixCusip=pd.read_pickle("fix_issuer_cusip_diffs.pkl")
+dfMask=pd.merge(dfMask,FixCusip,how='left',on='s_InvIssuer')
+dfMask['issuer_new']=dfMask.issuer_new.astype(str)
+dfMask['issuer']=list(map(lambda x,y: x if y=='nan' else y,dfMask.issuer.values,dfMask.issuer_new.values))
+dfMask=dfMask[['date', 's_InvIssuer', 's_CUSIP', 'issuer']]
+with open('old_issuers_full.pkl', 'wb') as f:
+                pickle.dump(dfMask, f)
+                
+#now just need to grab most recent observation for each s_invIsseuer for the dataset (not cusip specific)
+dfMask2=dfMask.sort_values('date').drop_duplicates(['s_InvIssuer'],keep='last')
+with open('old_issuers.pkl', 'wb') as f:
+                pickle.dump(dfMask2, f)
+###########################################################################
