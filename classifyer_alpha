@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 16 11:14:13 2020
+
+@author: m1kal01
+"""
+
+########################################################################################################################################
+#This file reads the current month securities file and matches issuers that we have seen exactly before 
+#as whatever we classified them last time. It also does some word search techniques to find its best guesses 
+#for ones it has never seen before.
+########################################################################################################################################
+import pandas as pd
+import numpy as np
+import re
+import sqlite3 
+from itertools import chain
+from nltk import word_tokenize
+import pickle
+import os
+from datetime import datetime
+from nltk.tokenize.treebank import TreebankWordDetokenizer
+pd.options.display.max_columns=500
+pd.options.display.max_rows=60
+
+os.chdir("/this_repository")
+########################################################################################################################################
+#### Exact Matches ####
+#Finding previous exact matches between SEC's new s_InvIssuer's and our FED issuers
+#This is the old securities_all dataset with most recent s_InvIssuer - Issuer pairs
+#old_issuers.pkl comes from old_issuers.py, which is run in the last step of nmfp production
+df=pd.read_pickle("old_issuers.pkl")
+df = df.replace(np.nan, '', regex=True)
+df['s_InvIssuer']=df['s_InvIssuer'].str.lower().str.strip() 
+df[df['issuer']==""]='aaaaaa unsorted'
+df['date'] = pd.to_datetime(df['date'].astype(str),errors='coerce', format="%Y-%m-%d")
+df['s_CUSIP']=df['s_CUSIP'].fillna('')
+df['s_CUSIP']=df['s_CUSIP'].replace("!",'')
+
+#This is the most recent raw nmfp data for the month we are processing
+dfNew=pd.read_csv("securities_new16_currentMonth.csv",usecols=["s_CUSIP","s_InvIssuer"])
+dfNew.columns=["s_CUSIP","s_InvIssuer"]
+dfNew['s_InvIssuer']=dfNew['s_InvIssuer'].str.lower().str.strip() 
+dfNew['s_CUSIP']=dfNew['s_CUSIP'].str.lower().str.strip()
+dfNew['s_CUSIP']=dfNew['s_CUSIP'].fillna('')
+dfNew['s_CUSIP']=dfNew['s_CUSIP'].replace("!",'')
+#dfNew[dfNew.s_InvIssuer.isin(Issuers.name_x.values)==False] #some check
+#########################################################################################################################################
+#Added block for fixing the chance that a single and double quote are accidently used together in s_InvIssuer
+#Like 'bank of america". This is important for the sql_push.py script
+def FindDoubleQuotes(text):      
+  matches=re.findall(r'\"(.+?)\"',text)
+  return ",".join(matches)
+Mistakes=list(filter(lambda x: x if FindDoubleQuotes(x) == '' and "\"" in x else None,df.s_InvIssuer.values))
+Mistakes=[x for x in Mistakes if "\'" in x]
+Fixed=[str(x).replace("\"","\'") for x in Mistakes if "\'" in x]
+for x in range(0,len(Fixed)): df['s_InvIssuer']=df['s_InvIssuer'].replace(Mistakes[x],Fixed[x])
+
+Mistakes=list(filter(lambda x: x if FindDoubleQuotes(x) == '' and "\"" in x else None,dfNew.s_InvIssuer.values))
+Mistakes=[x for x in Mistakes if "\'" in x]
+Fixed=[str(x).replace("\"","\'") for x in Mistakes if "\'" in x]
+for x in range(0,len(Fixed)): dfNew['s_InvIssuer']=dfNew['s_InvIssuer'].replace(Mistakes[x],Fixed[x])
+####################################################################
+#Some funtions to help with string matches 
+def WildCardStringMatch(selected_sheet,phrase): #Finds a fuzzy string match
+    try:
+        reg = re.compile(phrase)
+        HasString= np.unique(list(filter(lambda x: bool(re.match(reg, str(x))), np.array(selected_sheet))))
+    except:
+        HasString=None
+    return(HasString)
+
+def WildCardStringMatch2(selected_sheet,phrase): #Finds a fuzzy string match
+    try:
+        reg = re.compile(phrase)
+        HasString= np.unique(list(filter(lambda x: bool(re.match(reg, str(x))), np.array(selected_sheet))))
+    except:
+        HasString=[]
+    return(HasString)
+
+#Subroutine for considering cusip when its a TOB
+def TOBIssuer(past_issuer_matches,new_dataframe,old_dataframe):
+    #First find all TOBS that appear in the new dataset
+    TOBs=list(chain.from_iterable(list(map(lambda x: WildCardStringMatch(past_issuer_matches['s_InvIssuer'].values,x),["tender option bond","option bond","tender option","tob"]))))
+    TOBs=list(np.unique(TOBs))
+    TOBs=past_issuer_matches[past_issuer_matches['s_InvIssuer'].isin(TOBs)]
+    #Grab unique cusips in new dataset
+    dfNewCusip=pd.DataFrame(np.unique(new_dataframe["s_CUSIP"]),columns=['s_CUSIP'])
+    #Grab the most recent cusip/s_InvIssuer pair from the historical dataset
+    dfRecentCusip=old_dataframe.sort_values('date').drop_duplicates(['s_CUSIP'],keep='last')
+    #Merge and get, for the new data, what the issuer was last time that cusip occured
+    LastGuessCusip=pd.merge(dfNewCusip,dfRecentCusip,how='left',on="s_CUSIP")
+    LastGuessCusip=LastGuessCusip[['s_CUSIP','issuer']].drop_duplicates()
+    #Merge such that we only care about the issuer/cusip relation when it's a TOB. otherwsie we only want it to condier the s_InvIssuer
+    TOBGuessCusip=pd.merge(TOBs,LastGuessCusip,how='left',on='s_CUSIP')
+    TOBGuessCusip.columns=['s_InvIssuer','date','s_CUSIP','issuer_sInvIssuer','issuer_CUSIP']
+    #This will be places where it was once classified as a straight TOB and another time as what the issuer actually is specifically
+    TOBCUSIPDiffs=TOBGuessCusip[TOBGuessCusip['issuer_sInvIssuer'] != TOBGuessCusip['issuer_CUSIP']]
+    TOBCUSIPDiffs=TOBCUSIPDiffs[['s_InvIssuer','s_CUSIP','issuer_CUSIP']]
+    #Then Merge this with the not TOBs where we just matched it with whatever the s_InvIssuer was last classified as
+    LastGuess=pd.merge(past_issuer_matches,TOBCUSIPDiffs,how='left',on='s_InvIssuer')
+    #If it was a TOB, use the the last occuring cusip/issuer match, otherwise just use most recent s_invIssuer/issuer,match
+    LastGuess['issuer']=list(map(lambda x, y: y if pd.isnull(y) == False else x,np.array(LastGuess['issuer']),np.array(LastGuess['issuer_CUSIP'])))
+    LastGuess=LastGuess[['s_InvIssuer','s_CUSIP_x','issuer']]
+    LastGuess.columns=['s_InvIssuer','s_CUSIP','issuer']
+    return(LastGuess)
+    
+#For a given x,y combo search in x for most common words in y
+def Common(x,y):
+    try: y=y[np.argmax([len(np.intersect1d(x,item)) for item in y])]
+    except:  pass
+    return(y)
+#########################################################################################################################################
+#First looking at s_InvIssuer for non-TOBS. Whatever the raw nmfp name (s_InvIssuer) was last classified as by us
+dfNewInv=pd.DataFrame(np.unique(dfNew['s_InvIssuer']),columns=['s_InvIssuer'])
+LastGuessInv=pd.merge(dfNewInv,df,how='left',on='s_InvIssuer')
+#This is what, based on past classifications, we should cassify the new data, including a CUSIP consideration for TOBS
+LastGuess=TOBIssuer(LastGuessInv,dfNew,df)
+#Partioning those we can classify with/without checking (because we have verified that the most recent classification for that s_InvIssuer is correct for the Classified dataset)
+Classified=LastGuess[(LastGuess.issuer.notnull()) & (LastGuess.issuer != "")] #Because we have verified all past classfications are correct, we don't even need to verify these. They will always be correct unless someone makes new misclassificaitions to the data (unlikely)
+NotClassified=LastGuess[(LastGuess.issuer.isnull()) | (LastGuess.issuer == "")]
+del LastGuessInv,dfNewInv,LastGuess
+#Now we will examine s_InvIssuers we have not exactly seen before
+x_test=pd.DataFrame(NotClassified['s_InvIssuer'])
+x_test=x_test.reset_index(drop=True)
+#########################################################################################################################################
+#Finidng fixing word mispellings for added transparency 
+#This modified dataframe is ran in parralel with the dataframe as is and its BestGuess for issuer is added as other guesses to the orginial dataframe issuer guesses
+import enchant
+d = enchant.Dict("en_US")
+Mask=df[['issuer']].drop_duplicates()
+Mask['issuer']=Mask['issuer'].str.replace('[^\w\s]', '')
+tokenized_issuer_words = np.unique(list(chain.from_iterable(list(Mask['issuer'].apply(word_tokenize))))) #original dataframe, tokenizes s_InvIsssuers
+[d.add(item) for item in tokenized_issuer_words]
+Unknown_sInvIss=np.array(x_test['s_InvIssuer'].apply(word_tokenize))
+
+def Suggest(d,item):
+    if d.check(item) == True: #if it is a word
+        try:
+            float(item) #see if its a number
+            guess=''
+        except:guess=item
+    else:
+        guess=''
+    return(guess)
+      
+CleanedGuesses2=list(map(lambda x: [Suggest(d,item) for item in x],Unknown_sInvIss))
+CleanedGuesses2=list(map(lambda x: list(filter(None,x)),CleanedGuesses2))
+x_test['s_InvIssuer_2']=list(map(lambda x:TreebankWordDetokenizer().detokenize(x),CleanedGuesses2))
+ModDict=pd.Series(x_test.s_InvIssuer_2.values,index=x_test.s_InvIssuer).to_dict()
+dfNew2=dfNew.copy()
+dfNew2['s_InvIssuer']=list(map(lambda x: ModDict[x] if x in ModDict else x,dfNew['s_InvIssuer'].values))
+
+#x_test1 had the original dataframe. x_test2 is the dataframe with all mispellings removed
+x_test1=pd.DataFrame(x_test['s_InvIssuer'])
+x_test2=pd.DataFrame(x_test['s_InvIssuer_2']).drop_duplicates()
+x_test2.columns=['s_InvIssuer']
+
+
+def Main(dataframe,new_dataframe,true_df):
+    #########################################################################################################################################
+    #### Full string match (issuer) #####
+    #Finding Our Issuers for truly new s_InvIssuer's
+    #Looks to see if the name that appears on the SEC form ('s_InvIssuer') can be found in our list of issuers 
+    #For example, if the security came in as 'bank of america' it searches our issuers for the full string and finds the phrases 
+    #'bank of america', 'bank of america na ','bank of america corperation'
+    dataframe=dataframe.copy() #otherwise it was editing outside the function idk why
+    Y=pd.unique(true_df['issuer'])
+    Y=Y[np.where(list(map(lambda x:len(x)>1,Y)))]
+    X=dataframe['s_InvIssuer'].values
+    
+    def InArray (array1):
+        return(list(map(lambda y: y in array1, Y)))
+    
+    #is a list of, for each x_test, what are the indeces of Y (which is name_x) that match x_test
+    Indeces=list(map(lambda x : np.where(list(InArray(x))),X))
+    dataframe['YIndicator']=list(map(lambda x: Y[x],Indeces))
+    #In the case where there is more than one YIndicator found, choose the one which has the most words in common with the s_InvIssuer
+    tokenized_InvIss = list(dataframe['s_InvIssuer'].apply(word_tokenize)) #original dataframe, tokenizes s_InvIsssuers
+    tokenized_YIndicator=list(map(lambda x: [word_tokenize(item) for item in x], dataframe['YIndicator'].values)) #New dataframe, tokenizes xIndicators
+    dataframe['YIndicator']=list(map(lambda x,y: Common(x,y),tokenized_InvIss,tokenized_YIndicator))
+    dataframe['YIndicator']=list(map(lambda x:TreebankWordDetokenizer().detokenize(x),dataframe['YIndicator'].values))
+    #########################################################################################################################################
+    ### Partial string match (issuer) ###
+    #Looks to see if the name that appears on the SEC form ('s_InvIssuer') can be found in our list of issuers 
+    #For example, if the security came in as 'rye' it searches our issuers for that partial string and finds the phrases 
+    #'rye neck ny ufsd'
+    dataframe['YIndicator2']=list(map(lambda x: WildCardStringMatch2(Y,x),X))
+    tokenized_YIndicator2=list(map(lambda x: [word_tokenize(item) for item in x], dataframe['YIndicator2'].values)) #New dataframe, tokenizes xIndicators
+    dataframe['YIndicator2']=list(map(lambda x,y: Common(x,y),tokenized_InvIss,tokenized_YIndicator2))
+    dataframe['YIndicator2']=list(map(lambda x:TreebankWordDetokenizer().detokenize(x),dataframe['YIndicator2'].values))
+
+    #########################################################################################################################################
+    ### Full string match (s_InvIssuer) ###
+    #Looks to see if the name that appears on the SEC form ('s_InvIssuer') can be found in past s_InvIssuer's we have observed
+    #For example, if the security came in as 'bank of america repo' it searches our issuers for the full string and finds the phrases 
+    #'bank of america repo 3.00%', 'bank of america repo 8.00% 9-10-2019'
+    Y=np.unique(np.array(true_df['s_InvIssuer'].str.lower()))
+    Y=Y[np.where(list(map(lambda x:len(x)>1,Y)))]
+    X=np.array(pd.unique(dataframe['s_InvIssuer']))
+    
+    #is a list of, for each x_test, what are the indeces of Y (which is name_x) that match x_test
+    Indeces=list(map(lambda x : np.where(list(InArray(x))),X))
+    dataframe['XIndicator']=list(map(lambda x: np.unique([Y[item] for item in x]),Indeces))
+    #Translating from "s_InvIssuer" to "issuer" for XIndicator
+    Dict=pd.Series(true_df.issuer.values,index=true_df.s_InvIssuer).to_dict()
+    dataframe['XIndicator_2']=list(map(lambda x: np.array(pd.unique([Dict[item] if item in Dict.keys() else item for item in x])),dataframe['XIndicator'].values))
+    tokenized_InvIss = list(dataframe['s_InvIssuer'].apply(word_tokenize)) #original dataframe, tokenizes s_InvIsssuers
+    tokenized_XIndicator=list(map(lambda x: [word_tokenize(item) for item in x],dataframe['XIndicator_2'].values)) #New dataframe, tokenizes xIndicators
+    dataframe['XIndicator']=list(map(lambda x,y: Common(x,y),tokenized_InvIss,tokenized_XIndicator))
+    dataframe['XIndicator']=list(map(lambda x:TreebankWordDetokenizer().detokenize(x),dataframe['XIndicator'].values))
+    dataframe['XIndicator']=[s.replace(' )' , ')') for s in dataframe['XIndicator'].values]
+    dataframe['XIndicator']=[s.replace('( ' , '(') for s in dataframe['XIndicator'].values]
+
+    del Dict,Indeces,X,Y
+    #########################################################################################################################################
+    ### Cleaning up XIndicator for similar issuers like Bofa NA vs just Bofa ###
+    #Converting Ys to parents to grab a generalized x value
+    def ParentFinder():
+        dfParent=pd.read_csv("IssuerDetails.csv")
+        #setting it so if there is no parent (parent =-1) just use issuer id
+        dfParent['parent']=list(map(lambda x,y: x if x!=-1 else y, np.array(dfParent['parent']),dfParent['issuer_id']) )
+        WithParent=dfParent[['parent','name']]
+        WithParent.columns=['issuer_id','name']
+        dfParent=pd.merge(WithParent,dfParent,how='left',on='issuer_id')
+        dfParent=dfParent.drop(['parent','type','country','added','updated'],axis=1)
+        dfParent.columns=['parent_id','name','parent_name']
+        dfParent['parent_name']=dfParent['parent_name'].str.lower()
+        dfParent['name']=dfParent['name'].str.lower()
+        DictParent=pd.Series(dfParent.parent_name.values,index=dfParent.name).to_dict()
+        return(DictParent)
+        
+    DictParent=ParentFinder()
+    dataframe['XIndicator_2']=list(map(lambda x: list(np.unique([x if item not in DictParent else DictParent[item] for item in x])),dataframe['XIndicator_2'].values))
+    del DictParent
+    #########################################################################################################################################
+    ### Common words: x_indicators and s_InvIssuer ### 
+    def PatternFinder(Phrase,true_df):
+        PatternString='^'   #this allows re to match it in different ways, i.e the phrase is the first item in the string, last item, between items etc
+        for x in range (0,len(Phrase)):PatternString=PatternString+'(?=.*'+Phrase[x]+')'
+        pattern = re.compile(PatternString+'.+$')
+        UniqueInvIssuers=np.unique(true_df['s_InvIssuer'])
+        #First getting search results based off s_InvIssuer strings and then returning the issuer
+        DictInv=pd.Series(true_df.issuer.values,index=true_df.s_InvIssuer).to_dict()
+        SearchResultsSInv=list(filter(lambda x: pattern.findall(x),UniqueInvIssuers))
+        #Finding, for each unique issuer that apears in the search results, the s_inv issuer that has the selected phrase and also has the most words in common with the raw nmfp name (s_InvIssuer)
+        SearchToIssuers_inv=list(map(lambda x: DictInv[x] if x in DictInv else None,SearchResultsSInv))
+        SearchResultsSInvUn=np.unique(SearchToIssuers_inv) #########hgdfyhdfyh
+        results_token=[x.split() for x in SearchResultsSInvUn]
+        Phrase=Common(Phrase,results_token)
+        Phrase=TreebankWordDetokenizer().detokenize(Phrase)
+        if Phrase == "":
+            Phrase = None
+        return(Phrase)
+        
+    BadCharacters=["+",")","("]
+    tokenized_InvIss=list(map(lambda x: [item for item in x if item not in BadCharacters],tokenized_InvIss))
+    dataframe['XIndicator_new']=[PatternFinder(x,true_df) for x in tokenized_InvIss]   
+    
+    #########################################################################################################################################
+    ### Determining Final Guess ###
+    dataframe.columns = ["s_InvIssuer",'YIndicator','YIndicator2', 'XIndicator','XIndicator2','XIndicator_new']
+    #common issuers between X-indicator and Y-indicator
+    dataframe['Common']=list(map(lambda x,y: list(np.intersect1d(x,y)) if len (np.intersect1d(x,y))>0 and np.intersect1d(x,y)!="" else None,dataframe['XIndicator'].values,dataframe['YIndicator'].values))
+    dataframe['Common']=list(map(lambda x: x[0] if isinstance(x, list) else x,dataframe['Common'].values))
+    #Logic for what's a GoddGuess: 
+    #1.) If it appears as a guess in X-indicator and Y-indicator, guess that common one
+    #2.) if there is only one unique Y2Indicator, use YIndicator2 as Guess (if the security came in as 'rye' it searches our issuers for that partial string "rye" and finds the issuers containing "rye")
+    #3.) if there is only one unique YIndicator, use YIndicator as Guess (if the security came in as 'bank of america' it searches our issuers for the full string and finds the phrases 'bank of america', 'bank of america na ','bank of america corperation')
+    #4.) if there is only one unique X3indicator, use X3indicator (this is the xindicator that has the most words in common with the s_invIssuer)
+    #5.) else use x2 indicator (cleaned XIndicator to parent issuer when XIndicators are under same parent like Bofa NA vs just Bofa both really the same as Bank Of America Corporation (the parent))
+    dataframe['GoodGuess']=list(map(lambda x,x_new,common: np.unique(common) if common != None else 
+        x_new if x_new != None else np.unique(x),dataframe['XIndicator'].values,dataframe['XIndicator_new'].values,
+        dataframe['Common'].values))
+    dataframe['GoodGuess']=list(map(lambda x: x[0] if isinstance(x, np.ndarray) else x,dataframe['GoodGuess'].values))
+
+    #########################################################################################################################################
+    ### Combining all indicators into a list to guess from ###
+    Indicators=dataframe[['YIndicator', 'YIndicator2', 'XIndicator',
+           'XIndicator_new']].values.tolist()
+    Indicators=list(map(lambda x: pd.unique(list(filter(None,x))),Indicators))
+    dataframe['OtherGuesses'] = Indicators
+    #########################################################################################################################################
+    ### If it has genuinely no guesses, lets try a cusip match ###
+    dataframe['OtherGuesses2']=dataframe['OtherGuesses'].astype(str)
+    NoIdea=dataframe[dataframe['OtherGuesses2'].values=='[]'] 
+    InvCusipMapDict=pd.Series(new_dataframe.s_CUSIP.values,index=new_dataframe.s_InvIssuer).to_dict()
+    pd.options.mode.chained_assignment = None #ignore warning
+    NoIdea['s_CUSIP']=list(map(lambda x:InvCusipMapDict[x],NoIdea.s_InvIssuer))
+    
+    def CusipIssuer(selected_sheet,new_dataframe1,old_dataframe1):
+        #Grab unique cusips in new dataset
+        dfNewCusip=pd.DataFrame(np.unique(new_dataframe1["s_CUSIP"]),columns=['s_CUSIP'])
+        #Grab the most recent cusip/s_InvIssuer pair from the historical dataset
+        dfRecentCusip=old_dataframe1.sort_values('date').drop_duplicates(['s_CUSIP'],keep='last')
+        #Merge and get, for the new data, what the issuer was last time that cusip occured
+        LastGuessCusip=pd.merge(dfNewCusip,dfRecentCusip,how='left',on="s_CUSIP")
+        LastGuessCusip=LastGuessCusip[['s_CUSIP','issuer']].drop_duplicates()
+        #Merge such that we only care about the issuer/cusip relation when it's one we cant guess on
+        GuessCusip=pd.merge(selected_sheet,LastGuessCusip,how='left',on='s_CUSIP')
+        GuessCusip.columns=['s_InvIssuer','s_CUSIP','issuer']
+        GuessCusip['issuer'] = GuessCusip['issuer'].replace(np.nan, '', regex=True)
+        
+        return(GuessCusip)
+    NewGuess=CusipIssuer(NoIdea[['s_InvIssuer','s_CUSIP']],new_dataframe,true_df)
+    del dataframe['OtherGuesses2'],NoIdea['OtherGuesses2'] 
+    #########################################################################################################################################
+    ### This is a method, specially for treasuries, where they come in as just like a letter and date ### 
+    #eg.'b 11/17/20'. Even if we havent seen the cusip before, if another cusip was match for the same s_InvIssuer with special charcaters and numbers removed (e.g 'b'), use that issuer guess (US Treasury)
+    NewGuess['similar_name'] = NewGuess['s_InvIssuer'].str.replace('\d+', '')
+    NewGuess['similar_name'] = NewGuess['similar_name'].str.replace('[#,@,&,/,\,,,.]', '')
+    Issuer=NewGuess[NewGuess['issuer'] !=""][['similar_name','issuer']].drop_duplicates()
+    NewGuess=pd.merge(NewGuess,Issuer,how='left',on=['similar_name'])    
+    NewGuess=NewGuess[['s_InvIssuer', 's_CUSIP', 'issuer_y']]
+    NewGuess.columns=['s_InvIssuer', 's_CUSIP', 'issuer']
+    #########################################################################################################################################
+    dataframe['s_CUSIP']=list(map(lambda x:InvCusipMapDict[x],dataframe.s_InvIssuer)) #grabbing s_CUSIP from df 
+    dataframe=pd.merge(dataframe,NewGuess,on=['s_InvIssuer','s_CUSIP'],how='left')
+    dataframe['issuer'] = dataframe['issuer'].replace(np.nan, '', regex=True)
+    dataframe['OtherGuesses']=list(map(lambda x,y: [y] if str(x) == '[]' else x,np.array(dataframe['OtherGuesses']),np.array(dataframe['issuer'])))
+    dataframe = dataframe.replace(np.nan, '', regex=True)
+    del dataframe['issuer'],NewGuess
+    #########################################################################################################################################
+    return(dataframe)
+
+#Getting a mapping of issuer to issuer id. this csv was generated in the last step of MNFP production 
+IssuerIdMap=pd.read_csv("IssuerDetails.csv")
+IssuerIdMap['name']=IssuerIdMap['name'].str.lower().str.strip()
+IssuerIdMapDict=pd.Series(IssuerIdMap.issuer_id.values,index=IssuerIdMap.name).to_dict()
+IssuerIdMapDictReverse=pd.Series(IssuerIdMap.name.values,index=IssuerIdMap.issuer_id).to_dict()
+df['issuer_id']=list(map(lambda x: int(IssuerIdMapDict[x]) if x in IssuerIdMapDict else None,df.issuer.values))
+    
+#Program Execution
+Original=Main(x_test1,dfNew,df)
+Mod=Main(x_test2,dfNew2,df)
+Mod=Mod[['s_InvIssuer', 'YIndicator', 'YIndicator2', 'XIndicator', 'XIndicator2',
+       'XIndicator_new', 'Common', 'GoodGuess','OtherGuesses', 's_CUSIP']]
+Mod.columns=['s_InvIssuer_2', 'YIndicator', 'YIndicator2', 'XIndicator', 'XIndicator2',
+       'XIndicator_new', 'Common', 'GoodGuess', 'OtherGuesses', 's_CUSIP']
+Mod=pd.merge(x_test,Mod,on="s_InvIssuer_2",how="left") #Getting original s_InvIssuer back
+
+#Adding in the best guess from the modified dataframe
+Original['OtherGuesses']=list(map(lambda x,y: pd.unique(np.append(x,y)),Original.OtherGuesses.values,Mod.GoodGuess.values))
+
+x_test=Original.copy()
+
+with open('x_test.pkl', 'wb') as f:
+        pickle.dump(x_test, f)
+#########################################################################################################################################
+### Autoclassifying s_InvIssuers we have seen before ###
+#merge with all new classifiers to get diff cusip same s_InvIssuer matches 
+CompleteClassified=pd.merge(dfNew,Classified,on="s_InvIssuer", how="left")
+CompleteClassified=CompleteClassified[['s_InvIssuer','s_CUSIP_x', 'issuer']]
+CompleteClassified.columns=['s_InvIssuer', 's_CUSIP', 'issuer']
+CompleteClassified['s_CUSIP']=CompleteClassified['s_CUSIP'].fillna('')
+CompleteClassified['s_CUSIP']=CompleteClassified['s_CUSIP'].replace("!",'')
+CompleteClassified=CompleteClassified.drop_duplicates()
+CompleteClassified=CompleteClassified.dropna()
+
+#merge with old dataframe to find ones it has already seen/classsifed before exactly cusip and s_InvIssuer
+dfMask=pd.read_pickle('old_issuers_full.pkl')
+dfMask['s_CUSIP']=dfMask['s_CUSIP'].fillna('')
+dfMask['s_CUSIP']=dfMask['s_CUSIP'].replace("!",'')
+dfMask=dfMask[['s_InvIssuer','s_CUSIP']].drop_duplicates()
+merged = pd.merge(dfMask,CompleteClassified, how='outer', indicator=True)
+Autoclass_prev=merged[merged['_merge'] == 'both']
+Autoclass_prev['timestamp']=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+del Autoclass_prev['_merge']
+
+#This block checks to make sure there are no past missed securites present in securities_all_new16 that somehow did not make it into IssuerNames.sqldb
+Namesdf=pd.read_csv("IssuerNames.csv", encoding='latin-1',keep_default_na=False,na_values=[''])
+Namesdf=Namesdf[['name','cusip']].drop_duplicates()
+Namesdf.columns= ['s_InvIssuer','s_CUSIP']
+Namesdf['s_CUSIP']=Namesdf['s_CUSIP'].str.lower()
+Namesdf['s_CUSIP']=Namesdf['s_CUSIP'].fillna('')
+Namesdf['s_CUSIP']=Namesdf['s_CUSIP'].replace("!",'')
+MaskAuto=Autoclass_prev[['s_InvIssuer','s_CUSIP']].drop_duplicates()
+merged_set = pd.merge(Namesdf,MaskAuto, how='outer', indicator=True)
+questionable=merged_set[merged_set['_merge'] == 'right_only']
+del questionable['_merge']
+merged = pd.merge(questionable,Autoclass_prev, how='outer', indicator=True)
+Autoclass_prev=merged[merged['_merge'] == 'right_only']
+del Autoclass_prev['_merge']
+with open('Autoclass_prev.pkl', 'wb') as f:
+    pickle.dump(Autoclass_prev, f)
+
+#Classifications of s_invIssuer/cusip pair we haven't seen before but we have seen the s_InvIssuer before
+merged2 = pd.merge(CompleteClassified,Autoclass_prev, how='outer', indicator=True)
+Autoclass_new=merged2[merged2['_merge'] == 'left_only']
+Autoclass_new['timestamp']=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+del Autoclass_new['_merge']
+with open('Autoclass_new.pkl', 'wb') as f:
+    pickle.dump(Autoclass_new, f)
+#########################################################################################################################################
+### Prep for manual_issuer_calssification menu ##
+Cusips=list(x_test.s_CUSIP.values)
+Issuers=list(x_test.s_InvIssuer.values)
+OthGuesses=list(x_test.OtherGuesses.values)
+GoodGuesses=list(x_test.GoodGuess.values)
+
+#Initialize .pkl files, this information will be used in manual issuer classification to keep track of issuers in the case the program fails
+#By saving as a .pkl  file, the datatype is preserved i.e an integer written to a .pkl file when loaded will load an integer of that value
+with open('Issuers_List.pkl', 'wb') as f:
+    pickle.dump(Issuers, f)
+with open('OthGuesses_List.pkl', 'wb') as f:
+    pickle.dump(OthGuesses, f)            
+with open('GoodGuesses_List.pkl', 'wb') as f:
+    pickle.dump(GoodGuesses, f)
+with open('Cusips_List.pkl', 'wb') as f:
+    pickle.dump(Cusips, f)  
+with open('IndexIterator.pkl', 'wb') as f:
+    pickle.dump(0, f)  
+   
+#initializing a blank pkl files to write manual, modified and new issuer classifications in
+with open('manual_classifications.pkl', 'wb') as f:
+    pickle.dump(pd.DataFrame(columns=['date','s_InvIssuer', 's_CUSIP', 'issuer','issuer_id','timestamp']), f)
+
+with open('new_issuer_manual_classifications.pkl', 'wb') as f:
+    pickle.dump(pd.DataFrame(columns=['parent','issuer_id','country','type','name','added','updated','timestamp']), f)
+
+with open('modify_issuer_manual_classifications.pkl', 'wb') as f:
+    pickle.dump(pd.DataFrame(columns=['date', 's_InvIssuer', 's_CUSIP', 'issuer', 'issuer_id','timestamp']), f)
+
+with open('delete_issuer_manual_classifications.pkl', 'wb') as f:
+    pickle.dump(pd.DataFrame(columns=['parent','issuer_id','country','type','name','added','updated','timestamp']), f)
+
+with open('modify_issuers_issuer_manual_classifications.pkl', 'wb') as f:
+    pickle.dump(pd.DataFrame(columns=['parent', 'issuer_id', 'country', 'type', 'name', 'added', 'updated','timestamp', 'flag', 'name_real']), f)
+
+with open('old_dataframe.pkl', 'wb') as f:
+    pickle.dump(df,f)  
+    
+with open('issuer_id_dictionary.pkl', 'wb') as f:
+    pickle.dump(IssuerIdMapDict,f)  
+    
+with open('issuer_id_dictionary_reverse.pkl', 'wb') as f:
+    pickle.dump(IssuerIdMapDictReverse,f)  
+#########################################################################################################################################
+#Getting max issuer number and all unique issuer numbers from sql dataset  
+connection = sqlite3.connect("issuers.sqldb") 
+crsr = connection.cursor() 
+crsr.execute("select distinct issuer_id from issuer_details;") 
+IssuerIds = crsr.fetchall()
+IssuerIds=[x[0] for x in IssuerIds] #remove from tuple
+MaxIssuerId=max(IssuerIds) #get max issuer number
+IssuerIds=[str(x) for x in IssuerIds] #make it a list of strings because user will enter a string in manual_classification.py
+connection.close() 
+with open('max_issuer_id.pkl', 'wb') as f:
+    pickle.dump(MaxIssuerId, f) 
+with open('issuer_id_list.pkl', 'wb') as f:
+    pickle.dump(IssuerIds, f) 
