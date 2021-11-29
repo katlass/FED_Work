@@ -1,0 +1,15 @@
+import os
+
+directory="C:\Users\your_diretory"
+
+print("I'll try my best to classify issuers with classifier.py!")
+os.system("python3 "+directory+"classifier_alpha.py")
+
+print("Now you finish it up for me with manual_issuer_classification.py")
+os.system("python3 "+directory+"manual_issuer_classification.py")
+
+#Push Results to SQL
+print("Now pushing to sql with sql_push.py")
+os.system("python3 "+directory+"sql_push.py")
+
+print("All done with main.py!")
