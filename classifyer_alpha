@@ -10,7 +10,7 @@ Created on Wed Dec 16 11:14:13 2020
 #This file reads the current month securities file and matches issuers that we have seen exactly before 
 #as whatever we classified them last time. It also does some word search techniques to find its best guesses 
 #for ones it has never seen before.
-########################################################################################################################################
+#######################################################################################################################################
 import pandas as pd
 import numpy as np
 import re
