@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Nov 29 16:11:26 2021
+
+@author: m1kal01
+"""
+
+import sqlite3
+import pandas as pd
+from datetime import datetime
+import numpy as np
+import pickle
+pd.options.display.max_columns=500
+pd.options.display.max_rows=20
+import os, time
+#####################################################################################
+#This script pushes all the classifications to issuers.sqldb and genereates Issuer_Data.csv which is used in next part of process.
+#It stores all issuer data information
+#It also copies the issuer details information from our sql database and stores it as IssuerDetails.csv/IssuerNames.csv
+#####################################################################################
+#Final update for previously classified issuers to issuer_names.db
+######################################################################################
+#First we look as s_InvIssuers/Cusips we have seen before exactly
+#We look at issuer names to find instances where, in the historical names database, the classification for that s_InvIssuer/cusip
+#is different for some entries from what the autocassification is (which is picked based on best guess i.e most common classification)
+#(Done in same_name_diff_issuer.py >> old_issuers.py). I.e if s_InvIssuer is "bank of xxxxxx repo 2.5%" and cusip 3oixxxxx9 and the most common issuer 
+#algorithm picks "bank of xxxx corporation", it goes into the names database and changes all instances of that s_InvIssuer/cusip to 
+#bank of xxxx corporation. Otherwise, these autoclassifications have the current classification in the names database, and just 
+#the "updated" time paramter is changed to today
+AutoClassified=pd.read_pickle("Autoclass_prev.pkl")
+AutoClassified['s_CUSIP']=AutoClassified['s_CUSIP'].str.upper()
+IssuerNames=pd.read_csv("IssuerNames.csv", encoding='latin-1',keep_default_na=False,na_values=[''])
+IssuerNames.columns=['s_InvIssuer','issuer','issuer_id','s_CUSIP','added','updated']
+IssuerNames['issuer']=IssuerNames['issuer'].str.lower()
+IssuerNames['s_CUSIP']=IssuerNames['s_CUSIP'].fillna('')
+IssuerNames['s_CUSIP']=IssuerNames['s_CUSIP'].replace("!",'')
+merge=pd.merge(IssuerNames,AutoClassified,how="right",indicator=True,on=['s_InvIssuer','s_CUSIP'])
+#Strip out the previously classifed s_InvIssuers that now have a better issuer guess (most common past issuer from same_name_diff_issuer.py)
+Diffs=merge[merge.issuer_x != merge.issuer_y]
+FixPast=pd.read_pickle("fix_issuer_cusip_diffs.pkl").s_InvIssuer.values
+Diffs=Diffs[Diffs.s_InvIssuer.isin(FixPast)]
+Diffs=Diffs[['s_InvIssuer','s_CUSIP','issuer_y']]
+Diffs.columns=['s_InvIssuer','s_CUSIP','issuer']
+Diffs=Diffs.drop_duplicates()
+Aut=pd.merge(Diffs,AutoClassified,how="outer",indicator=True,on=['s_InvIssuer','s_CUSIP'])
+Aut=Aut.drop_duplicates()
+Aut=Aut[Aut._merge == "right_only"].drop_duplicates()
+Aut=Aut[['s_InvIssuer','s_CUSIP',"issuer_y",'timestamp']]
+Aut.columns=['s_InvIssuer','s_CUSIP',"issuer",'timestamp']
+AutoClassified=Aut
+del Aut
+
+#date it was last updated
+AutoClassified_timestamp=pd.read_pickle("auto_classifications_sql_timestamp_previous.pkl")
+#date of the file right now
+LastModifiedDate = os.stat("Autoclass_prev.pkl")[8]
+LastModifiedDate=time.ctime(LastModifiedDate)
+LastModifiedDate=datetime.strptime(LastModifiedDate, '%a %b %d %H:%M:%S %Y')
+try:AutoClassified_timestamp=datetime.strptime(AutoClassified_timestamp, '%a %b %d %H:%M:%S %Y')
+except:pass
+
+if LastModifiedDate>AutoClassified_timestamp: #This will only trigger if it has been changed since last time it ran
+    today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    connection = sqlite3.connect("issuers.sqldb")  
+    crsr = connection.cursor() 
+    #combining s_InvIssuer and cusip to get unique pairing for much faster sql psh than a for loop
+    UniqueID=AutoClassified['s_InvIssuer']+" "+AutoClassified['s_CUSIP']
+    ClassIssuers=list(UniqueID.values)
+    sql_list = str(tuple([key for key in ClassIssuers])).replace(',)', ')')
+    #Creating a dummy COLNew for the combo issuer/cusip
+    query ='ALTER TABLE issuer_names ADD COLUMN COLNew text'
+    crsr.execute(query)
+    query ='UPDATE issuer_names SET COLNew = name || \' \' || cusip'
+    crsr.execute(query)
+    #matching on that unique combo
+    query ='Update issuer_names set updated = "'+today+'" where COLNew IN {sql_list}'.format(sql_list=sql_list)
+    crsr.execute(query)
+    #dropping the useless column
+    query ='CREATE TABLE temp AS SELECT name, issuer_id, cusip,added,updated from issuer_names'
+    crsr.execute(query)
+    query ='DROP TABLE issuer_names'
+    crsr.execute(query)
+    query ='ALTER TABLE `temp` RENAME TO `issuer_names`'
+    crsr.execute(query)
+    connection.commit()
+    connection.close()
+    with open('auto_classifications_sql_timestamp_previous.pkl', 'wb') as f:
+        pickle.dump(LastModifiedDate, f)
+
+#####################################################################################
+#Now for genuainely new cusips but s_InvIssuers we have seen exactly before
+#read in a straight pull from issuer_details.db to go from issuer name to issuer id
+IssuerIdMap=pd.read_csv("IssuerDetails.csv")
+IssuerIdMap['name']=IssuerIdMap['name'].str.lower().str.strip()
+IssuerIdMapDict=pd.Series(IssuerIdMap.issuer_id.values,index=IssuerIdMap.name).to_dict()
+AutoClassified=pd.read_pickle("Autoclass_new.pkl")
+AutoClassified['issuer_id']=list(map(lambda x: IssuerIdMapDict[x] if x in IssuerIdMapDict else None,AutoClassified.issuer.values))
+AutoClassified['s_CUSIP']=AutoClassified['s_CUSIP'].str.upper()
+AutoClassified['added']= AutoClassified['timestamp']
+AutoClassified['updated']= AutoClassified['timestamp']
+
+AutoClassified=AutoClassified[['s_InvIssuer','issuer_id','s_CUSIP','added','updated']]
+AutoClassified.columns=["name","issuer_id","cusip","added","updated"]
+
+#date it was last updated
+AutoClassified_timestamp=pd.read_pickle("auto_classifications_sql_timestamp_new.pkl")
+#date of the file right now
+LastModifiedDate = os.stat("Autoclass_new.pkl")[8]
+LastModifiedDate=time.ctime(LastModifiedDate)
+LastModifiedDate=datetime.strptime(LastModifiedDate, '%a %b %d %H:%M:%S %Y')
+try:AutoClassified_timestamp=datetime.strptime(AutoClassified_timestamp, '%a %b %d %H:%M:%S %Y')
+except:pass
+
+if LastModifiedDate>AutoClassified_timestamp: #This will only trigger if it has been changed since last time it ran
+    connection = sqlite3.connect("issuers.sqldb")  
+    AutoClassified.to_sql('issuer_names',connection , if_exists='append', index=False)
+    connection.commit()
+    connection.close()
+    with open('auto_classifications_sql_timestamp_new.pkl', 'wb') as f:
+        pickle.dump(LastModifiedDate, f) 
+        
+#####################################################################################
+#Final update for new issuers to issuer_details.db
+######################################################################################
+NewIssuers=pd.read_pickle("new_issuer_manual_classifications.pkl")
+NewIssuers=NewIssuers[NewIssuers.name.isin(IssuerIdMap.name.values)==False]
+NewIssuerIdMapDict=pd.Series(NewIssuers.issuer_id.values,index=NewIssuers.name).to_dict()
+NewIssuers['added']= NewIssuers['timestamp']
+NewIssuers['updated']= NewIssuers['timestamp']
+del NewIssuers['timestamp']
+NewIssuers_timestamp=pd.read_pickle("new_issuers_sql_timestamp.pkl")
+#date of the file right now
+LastModifiedDate = os.stat("new_issuer_manual_classifications.pkl")[8]
+LastModifiedDate=time.ctime(LastModifiedDate)
+LastModifiedDate=datetime.strptime(LastModifiedDate, '%a %b %d %H:%M:%S %Y')
+try:
+    NewIssuers_timestamp=datetime.strptime(NewIssuers_timestamp, '%a %b %d %H:%M:%S %Y')
+except:
+    pass
+
+if LastModifiedDate>NewIssuers_timestamp: #This will only trigger if it has been changed since last time it ran
+    connection = sqlite3.connect("issuers.sqldb")  
+    NewIssuers.to_sql('issuer_details',connection , if_exists='append', index=False)
+    connection.commit()
+    connection.close()
+    with open('new_issuers_sql_timestamp.pkl', 'wb') as f:
+        pickle.dump(LastModifiedDate, f) 
+    #with open('new_issuer_manual_classifications.pkl', 'wb') as f:
+        #pickle.dump(pd.DataFrame(columns=['parent','issuer_id','country','type','name','added','updated','timestamp']), f) 
+    
+#####################################################################################
+#Final update for manually classified issuers to issuer_names.db
+######################################################################################
+ManualClass=pd.read_pickle("manual_classifications.pkl")
+ManualClass=ManualClass.drop_duplicates()
+#read in a straight pull from issuer_details.db to go from issuer name to issuer id
+#get new IssuerDetails that will include NewIssuers
+#IssuerIdMap=pd.read_csv("IssuerDetails.csv")
+#IssuerIdMap['name']=IssuerIdMap['name'].str.lower().str.strip()
+#IssuerIdMapDict=pd.Series(IssuerIdMap.issuer_id.values,index=IssuerIdMap.name).to_dict()
+#try: IssuerIdMapDict.update(NewIssuerIdMapDict) #if there are new issuers, add those issuers to the dictionary of issuer_ids
+#except:pass
+##ManualClass['issuer_id']=list(map(lambda x: IssuerIdMapDict[x] if x in IssuerIdMapDict else None,ManualClass.issuer.values))
+ManualClass['s_CUSIP']=ManualClass['s_CUSIP'].str.upper()
+ManualClass['added']= ManualClass['timestamp']
+ManualClass['updated']= ManualClass['timestamp']
+ManualClassdf=ManualClass[['s_InvIssuer','issuer_id','s_CUSIP','added','updated']]
+ManualClassdf.columns=["name","issuer_id","cusip","added","updated"]
+ManualIssuers_timestamp=pd.read_pickle("manual_classifications_sql_timestamp.pkl")
+#date of the file right now
+LastModifiedDate = os.stat("manual_classifications.pkl")[8]
+LastModifiedDate=time.ctime(LastModifiedDate)
+LastModifiedDate=datetime.strptime(LastModifiedDate, '%a %b %d %H:%M:%S %Y')
+try:ManualIssuers_timestamp=datetime.strptime(ManualIssuers_timestamp, '%a %b %d %H:%M:%S %Y')
+except:pass
+
+if LastModifiedDate>ManualIssuers_timestamp: #This will only trigger if it has been changed since last time it ran
+    connection = sqlite3.connect("issuers.sqldb")  
+    ManualClassdf.to_sql('issuer_names',connection , if_exists='append', index=False)
+    connection.commit()
+    connection.close()
+    with open('manual_classifications_sql_timestamp.pkl', 'wb') as f:
+        pickle.dump(LastModifiedDate, f) 
+#####################################################################################
+#Final update for modified (amod) previously classified issuers to issuer_names.db
+#Also a push for those autoclassifcations stripped out for being different under the most common issuer selection algorithm
+######################################################################################
+ModClassified_names_prev=pd.read_pickle("modify_issuer_manual_classifications_names.pkl")
+ModClassified=pd.read_pickle("modify_issuer_manual_classifications.pkl")
+AllModNames= ModClassified.s_InvIssuer.values
+ModClassified=ModClassified[ModClassified.s_InvIssuer.isin(ModClassified_names_prev)==False]
+today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+Diffs['date']=today
+Diffs['timestamp']=today
+Diffs['issuer_id']=list(map(lambda x: int(IssuerIdMapDict[x]) if x in IssuerIdMapDict else None,Diffs.issuer.values))
+Diffs=Diffs[['date', 's_InvIssuer', 's_CUSIP', 'issuer', 'issuer_id', 'timestamp']]
+ModClassified=ModClassified.append(Diffs)
+
+ModIssuers_timestamp=pd.read_pickle("modify_issuer_manual_classifications_sql_timestamp.pkl")
+#date of the file right now
+LastModifiedDate = os.stat("modify_issuer_manual_classifications.pkl")[8]
+LastModifiedDate=time.ctime(LastModifiedDate)
+LastModifiedDate=datetime.strptime(LastModifiedDate, '%a %b %d %H:%M:%S %Y')
+try: ModIssuers_timestamp=datetime.strptime(ModIssuers_timestamp, '%a %b %d %H:%M:%S %Y')
+except: pass
+
+if LastModifiedDate>ModIssuers_timestamp: #This will only trigger if it has been changed since last time it ran
+    connection = sqlite3.connect("issuers.sqldb")  
+    crsr = connection.cursor() 
+    for row in range(0,len(ModClassified)):
+        try:
+            query ='Update issuer_names set issuer_id = '+str(ModClassified.issuer_id.values[row])+' where name = \''''+str(ModClassified.s_InvIssuer.values[row])+'\''''
+            crsr.execute(query)
+            query2 ='Update issuer_names set updated = "'+today+'" where name = \''''+str(ModClassified.s_InvIssuer.values[row])+'\''''
+            crsr.execute(query2)
+        except:
+            query ='Update issuer_names set issuer_id = '+str(ModClassified.issuer_id.values[row])+' where name = \"'+str(ModClassified.s_InvIssuer.values[row])+'\"'
+            crsr.execute(query)
+            query2 ='Update issuer_names set updated = "'+today+'" where name = \"'+str(ModClassified.s_InvIssuer.values[row])+'\"'
+            crsr.execute(query2)
+    connection.commit()
+    connection.close()
+    with open('modify_issuer_manual_classifications_sql_timestamp.pkl', 'wb') as f:
+        pickle.dump(LastModifiedDate, f) 
+    with open('modify_issuer_manual_classifications_names.pkl', 'wb') as f:
+        pickle.dump(AllModNames, f)    
+        
+#####################################################################################
+#Final update for modifying an issuer (imod) in issuer_details.db
+######################################################################################
+ModIssuer=pd.read_pickle("modify_issuers_issuer_manual_classifications.pkl")
+#ModIssuerIdMapDict=pd.Series(ModClassified.issuer_id.values,index=NewIssuers.name).to_dict()
+today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+ModIssuersIssuer_timestamp=pd.read_pickle("modify_issuers_issuer_manual_classifications_sql_timestamp.pkl")
+#date of the file right now
+LastModifiedDate = os.stat("modify_issuers_issuer_manual_classifications.pkl")[8]
+LastModifiedDate=time.ctime(LastModifiedDate)
+LastModifiedDate=datetime.strptime(LastModifiedDate, '%a %b %d %H:%M:%S %Y')
+try:ModIssuersIssuer_timestamp=datetime.strptime(ModIssuersIssuer_timestamp, '%a %b %d %H:%M:%S %Y')
+except:pass
+
+if LastModifiedDate>ModIssuersIssuer_timestamp: #This will only trigger if it has been changed since last time it ran
+    connection = sqlite3.connect("issuers.sqldb")  
+    crsr = connection.cursor() 
+    for row in range(0,len(ModIssuer)):
+        if ModIssuer.flag.values[row] == 'parent':
+             query ='Update issuer_details set parent = '+str(int(ModIssuer.parent.values[row]))+' where LOWER(name) = \''+str(ModIssuer.name.values[row])+'\''
+             crsr.execute(query)
+        if ModIssuer.flag.values[row] == 'country':    
+             query ='Update issuer_details set country = \''+str(ModIssuer.country.values[row])+'\' where LOWER(name) = \''+str(ModIssuer.name.values[row])+'\''
+             crsr.execute(query) 
+        if ModIssuer.flag.values[row] == 'name':    
+             query ='Update issuer_details set name = \''+str(ModIssuer.name.values[row])+'\' where LOWER(name) = \''+str(ModIssuer.name_real.values[row])+'\''
+             crsr.execute(query)          
+        if ModIssuer.flag.values[row] == 'type':    
+             query ='Update issuer_details set type = \''+str(ModIssuer.type.values[row])+'\' where LOWER(name) = \''+str(ModIssuer.name.values[row])+'\''
+             crsr.execute(query)          
+        query2 ='Update issuer_details set updated = "'+today+'" where LOWER(name) = \''+str(ModIssuer.name.values[row])+'\''
+        crsr.execute(query2) 
+    
+    connection.commit()
+    connection.close()
+    with open('modify_issuers_issuer_manual_classifications_sql_timestamp.pkl', 'wb') as f:
+        pickle.dump(LastModifiedDate, f) 
+#####################################################################################
+#Final update for deleting issuers from issuer_details.db
+######################################################################################
+DelIssuers=pd.read_pickle("delete_issuer_manual_classifications.pkl")
+DelIssuersIdMapDict=pd.Series(DelIssuers.issuer_id.values,index=DelIssuers.name).to_dict()
+DeleteIssuer_timestamp=pd.read_pickle("delete_issuer_manual_classifications_sql_timestamp.pkl")
+#date of the file right now
+LastModifiedDate = os.stat("delete_issuer_manual_classifications.pkl")[8]
+LastModifiedDate=time.ctime(LastModifiedDate)
+LastModifiedDate=datetime.strptime(LastModifiedDate, '%a %b %d %H:%M:%S %Y')
+try:DeleteIssuer_timestamp=datetime.strptime(DeleteIssuer_timestamp, '%a %b %d %H:%M:%S %Y')
+except: pass
+
+if LastModifiedDate>DeleteIssuer_timestamp: #This will only trigger if it has been changed since last time it ran
+    connection = sqlite3.connect("issuers.sqldb") 
+    crsr = connection.cursor() 
+    for row in range(0,len(DelIssuers)):
+        query ='delete from issuer_details where issuer_id = '+str(int(DelIssuers.issuer_id.values[row]))
+        crsr.execute(query)
+        query ='Update issuer_names set issuer_id = \'\' where issuer_id = '+str(int(DelIssuers.issuer_id.values[row]))
+        crsr.execute(query)          
+    connection.commit()
+    connection.close()
+    with open('delete_issuer_manual_classifications_sql_timestamp.pkl', 'wb') as f:
+        pickle.dump(LastModifiedDate, f)
+
+
+#####################################################################################
+#Pulling all new issuer names/details from issuers.sqldb, getting ultimate parent information, 
+#Prepping Isssuers_Data.csv (contains all historical s_InvIssuer/cusip/issuer information) for mfp_merge_new.sas
+#####################################################################################
+os.system('sqlite3 -header -csv issuers.sqldb "select * from issuer_details;" > IssuerDetails.csv')
+os.system('sqlite3 -header -csv issuers.sqldb "select * from issuer_names;" > IssuerNames.csv')
+#Getting ultimate parent country
+IssuerNames=pd.read_csv("IssuerNames.csv", encoding='latin-1',keep_default_na=False,na_values=[''],usecols=['name','issuer_id','cusip']).drop_duplicates()
+IssuerNames['cusip']=IssuerNames['cusip'].fillna('')
+IssuerNames['cusip']=IssuerNames['cusip'].replace("!",'')
+IssuerDetails=pd.read_csv("IssuerDetails.csv", encoding='latin-1', usecols=['parent', 'issuer_id', 'country', 'type', 'name']).drop_duplicates()
+Issuers=pd.merge(IssuerNames,IssuerDetails,how='right',on="issuer_id")
+Key=Issuers[["issuer_id","name_y"]].drop_duplicates() #translating from parent issuer_id to parent issuer_name
+Key.columns=["parent","parent_name"]
+Issuers=pd.merge(Issuers,Key,how='left',on='parent')
+
+IssuerIdCountryDict=pd.Series(Issuers.country.values,index=Issuers.issuer_id).to_dict()
+IssuerIdIssuerDict=pd.Series(Issuers.name_y.values,index=Issuers.issuer_id).to_dict()
+IssuerIdParentDict=pd.Series(Issuers.parent.values,index=Issuers.issuer_id).to_dict()
+Info=Issuers[["issuer_id","parent"]].drop_duplicates()
+ 
+def GetUltimateParent(issuer_id,parent): #Recursively finds the ultimate parent for each issuer_id
+    if parent == -1 or np.isnan(parent)==True:
+        UltimateParentCountry=IssuerIdCountryDict[issuer_id]
+        UltimateParent=IssuerIdIssuerDict[issuer_id]
+    else:return(GetUltimateParent(parent,IssuerIdParentDict[parent]))
+    return([UltimateParentCountry,UltimateParent])
+
+ultimate_parent=list(map(lambda x,y: GetUltimateParent(x,y),Info.issuer_id.values,Info.parent.values))
+Info['ultimate_country']=[item[0] for item in ultimate_parent]
+Info['ultimate_parent']=[item[1] for item in ultimate_parent]
+
+IssuerIdUltCountryDict=pd.Series(Info.ultimate_country.values,index=Info.issuer_id).to_dict()
+IssuerIdUltParentDict=pd.Series(Info.ultimate_parent.values,index=Info.issuer_id).to_dict()
+Issuers['ultimate_country']=list(map(lambda x: IssuerIdUltCountryDict[x],Issuers.issuer_id.values))
+Issuers['ultimate_parent']=list(map(lambda x: IssuerIdUltParentDict[x],Issuers.issuer_id.values))
+
+Issuers=Issuers[["ultimate_country","ultimate_parent","name_y","name_x","cusip","type"]]
+Issuers.to_csv("Issuers_Data.csv",index=False,encoding='utf-8-sig')
+
+########################
+#Also linking IssuerNames/IssuerDetails on issuer_id so in IssuerNames.csv we see issuer not just issuer_id. This is
+#For RA convienience, this will be used later in same_name_diff_issuer.py and old_issuers.py which are ran at the end of NMFP
+dfUniqueID=pd.read_csv("IssuerDetails.csv")
+dfReported =pd.read_csv("IssuerNames.csv", encoding='latin-1',keep_default_na=False,na_values=[''])
+df=pd.merge(dfReported,dfUniqueID,on="issuer_id",how='left')
+df=df[['name_x', 'name_y','issuer_id', 'cusip', 'added_x', 'updated_x']]
+df.columns=['name','issuer','issuer_id', 'cusip', 'added', 'updated']
+df.to_csv('IssuerNames.csv',index=False)
