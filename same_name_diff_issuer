@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Mar 22 13:58:16 2021
+
+@author: m1kal01
+"""
+##########################################################################
+#This file checks for and corrects instances where the same s_InvIssuer (raw nmfp name) has a different issuer between cusips
+#by selecting the most common issuer for the s_invIssuer. This is used in old_issuers.py 
+import pandas as pd
+import pickle
+from itertools import chain
+import re
+
+#Reading in Issuer Details/mapping
+IssuerIdMap=pd.read_csv("IssuerDetails.csv")
+IssuerIdMap['name']=IssuerIdMap['name'].str.lower().str.strip()
+IssuerIdMapDictReverse=pd.Series(IssuerIdMap.name.values,index=IssuerIdMap.issuer_id).to_dict()
+
+#Taking issuer names, dropping duplicate with issuer_id
+names_real=pd.read_csv("IssuerNames.csv", encoding='latin-1',keep_default_na=False,na_values=[''])
+names_real['cusip']=names_real['cusip'].fillna('')
+names_real['cusip']=names_real['cusip'].replace("!",'')
+names=names_real[['name','issuer_id']].drop_duplicates()
+#Flagging s_InvIssuers that have been classified as more than 1 issuer_id
+Bad=pd.DataFrame(names.name.value_counts()[(names.name.value_counts()>1)])
+Bad=Bad.reset_index()
+Bad.columns=["name","counts"]
+BadNames=Bad.name.values
+
+#Removing tob issuers double guess as a precaution i.e is security is labeled "escondido" one time and we label it TOB, we don't always want to label issues that come in that way as tob
+CommonTOBWords=["tender","floater","tob","tobs","option"]
+def FindString(Phrase): #Fuzzy string match ;)
+    Phrase=Phrase.split()
+    PatternString='^'   #this allows re to match it in different ways, i.e the phrase is the first item in the string, last item, between items etc
+    for x in range (0,len(Phrase)):PatternString=PatternString+'(?=.*'+Phrase[x]+')'
+    pattern = re.compile(PatternString+'.+$')
+    Contain=list(filter(lambda x: pattern.findall(x),BadNames))
+    return(Contain)
+
+HaveTOBWords=pd.unique(list(chain.from_iterable(list(map(lambda x: FindString(x),CommonTOBWords)))))
+NotTOBs=Bad[Bad.name.isin(HaveTOBWords)==False]
+names_real_notTOB=names_real[names_real.name.isin(NotTOBs.name.values)]
+
+#Avoid case where it has only had 1 single other classification of each issuer
+Valid=pd.DataFrame(names_real_notTOB.name.value_counts()[names_real_notTOB.name.value_counts().values>2])
+Valid=Valid.reset_index()
+Valid.columns=['s_InvIssuer','count']
+Valid=Valid.s_InvIssuer.values
+names_real_notTOB=names_real_notTOB[names_real_notTOB.name.isin(Valid)]
+
+#Finding and selecting most frequest issuer classification
+names_real_notTOB['Most_Common_Issuer'] = (
+    names_real_notTOB.groupby('name')['issuer_id'].transform(lambda x: x.value_counts().idxmax()))
+Mask=names_real_notTOB.copy()
+Mask['issuer_id']=Mask['Most_Common_Issuer']
+Answers=Mask[['name','issuer_id']].drop_duplicates()
+Answers['issuer']=list(map(lambda x: IssuerIdMapDictReverse[x] if x in IssuerIdMapDictReverse else None,Answers.issuer_id.values))
+Answers=Answers[['name','issuer']]
+Answers.columns=['s_InvIssuer','issuer_new']
+
+with open('fix_issuer_cusip_diffs.pkl', 'wb') as f:
+                pickle.dump(Answers, f)         
+                
+##########################################################################
